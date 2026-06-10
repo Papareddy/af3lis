@@ -1,0 +1,53 @@
+# --- local cluster config (NEVER commit; copy from config.example.yaml) ---
+config.yaml
+
+# --- runs, caches, outputs ---
+runs/
+out/
+logs/
+seq_cache/
+msa_cache/
+*.permodel.csv
+
+# --- large prediction outputs / structures ---
+*.npz
+*.cif
+*.pdb
+*.bin.zst
+!tests/data/*.pdb     # keep tiny test fixtures
+!tests/data/*.cif     # keep tiny test fixtures
+
+# --- python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- virtualenvs ---
+.venv/
+venv/
+env/
+
+# --- editors / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- rendered SLURM artifacts (per-run; live under outdir but guard root too) ---
+align.sbatch
+infer.sbatch
+SUBMIT_CMDS.sh
+af3_json_list.txt
+RUNBOOK.md

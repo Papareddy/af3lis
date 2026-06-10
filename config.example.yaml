@@ -1,0 +1,69 @@
+# Copy to config.yaml (gitignored) and edit for your cluster. Simple key: value.
+# AF3 mirror of boltzlis config.example.yaml.
+# Generic placeholders only -- never commit real cluster paths or usernames.
+
+# AF3 module on the cluster. Loaded by both align + infer sbatches.
+# Module sets $ALPHAFOLD_BIN_DIR and $ALPHAFOLD_DATABASES for you.
+af3_module: bio/alphafold/3.0.1
+
+# User-private (gated) AF3 weights -- request access from DeepMind, install to
+# $HOME/af3-models/ (must contain af3.bin.zst). Symlink ok.
+model_dir: /path/to/af3-models
+
+# AF3 reference DBs (~628 GB). DEFAULT = the system-wide env-expand the
+# bio/alphafold module ships -- matches the current working setup.
+# Only override with a user copy if you have a complete mirror.
+db_dir: ${ALPHAFOLD_DATABASES}
+
+# Python with numpy+scipy+pandas+matplotlib (for lis.py / collect / plot).
+# Your cluster analysis env -- NOT the AF3 module's bundled python.
+python: /path/to/conda/envs/analysis/bin/python
+
+# Workspace root on the cluster. JSONs, out/, logs/, msa/ land under here.
+workspace: /path/to/scratch/af3_screen
+
+# UniProt FASTA disk cache. Sharing with boltzlis is fine (identical key scheme).
+seq_cache: /path/to/seq_cache
+
+# ----- SLURM: alignment stage (CPU MSA + templates) -----
+align_partition: cpu-single
+align_time: 12:00:00
+align_mem: 64gb
+align_cpus: 16
+# Extra flags appended to the alignment stage (e.g. --max_template_date=2024-01-01).
+align_extra: ""
+
+# ----- SLURM: inference stage (GPU diffusion) -----
+infer_partition: gpu-single
+# Helix-specific GRES; use 'gpu:1' for generic SLURM.
+infer_gpu_gres: gpu:A100:1
+# Minimum GPU memory hint (informational; SLURM gres carries the real constraint).
+# A100-40GB clears ~3100-residue complexes with xla_mem_frac >= 3.0; for >3500
+# residues prefer A100-80GB and set flash_attn=xla.
+infer_gpumem: 40G
+# Bump to 06:00:00 for >2500-residue complexes (large-complex class).
+infer_time: 02:00:00
+infer_mem: 60gb
+infer_cpus: 8
+# Unified-memory factor for XLA. >1 enables GPU->host CPU spillover via
+# TF_FORCE_UNIFIED_MEMORY=true. 3.2 is the empirical floor for ~3000-residue
+# complexes on A100-40GB; 1.5 is plenty for <=1500-residue pairs.
+xla_mem_frac: 3.2
+# Flash-attention backend: triton | cudnn | xla.
+# Note: some A100 firmware miscompiles triton (silent NaN ipTM) -- fall back to
+# xla if that happens. cudnn needs cuDNN 9+.
+flash_attn: triton
+# AF3 --num_diffusion_samples per seed. Total samples per pair = len(seeds) * num_samples.
+num_samples: 5
+num_recycles: 10
+# Extra flags appended to the inference stage.
+infer_extra: ""
+
+# ----- AF3 sampling -----
+# list[int]; total samples per pair = len(seeds) * num_samples.
+# CHANGING THIS REQUIRES REBUILDING JSONS (modelSeeds is baked in stage 1;
+# the MSA in the align stage is keyed by the JSON content).
+seeds: [1]
+
+# Public-repo safety: config.yaml is gitignored. Never commit real screen
+# target names or cluster usernames here.

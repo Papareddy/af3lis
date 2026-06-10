@@ -1,0 +1,106 @@
+#!/bin/bash
+#SBATCH -J {JOBNAME}_infer
+#SBATCH -p {INFER_PARTITION}
+#SBATCH --gres={GPU_GRES}
+#SBATCH --time={INFER_TIME}
+#SBATCH --mem={INFER_MEM}
+#SBATCH --cpus-per-task={INFER_CPUS}
+#SBATCH -o {OUTDIR}/logs/infer_%A_%a.out
+# stderr merges into stdout (single -o, no -e) — avoids inode-race truncation
+# seen on some SLURM versions when -o and -e point at the same file.
+# af3lis -- AF3 stage 2: GPU inference (featurisation + model). Reads the
+# MSA-augmented *_data.json produced by the align stage on the same list file,
+# then runs diffusion sampling (num_samples per seed; seeds were baked into the
+# input JSON in stage 1 -- DO NOT edit seeds here, rebuild instead).
+#
+# Submit:
+#   sbatch --dependency=afterok:<align_jobid> --array=1-{NJOBS} af3_infer.sbatch
+# Or rerun standalone (data.json already present):
+#   sbatch --array=1-{NJOBS} af3_infer.sbatch
+#
+# XLA env (empirically tuned on Helix A100-40GB for ECT x CCR4-NOT screens):
+#   XLA_PYTHON_CLIENT_PREALLOCATE=false  - allocate on-demand (avoids holding the
+#                                          full device for tiny early jobs)
+#   TF_FORCE_UNIFIED_MEMORY=true         - enable CUDA managed-memory: pages can
+#                                          spill GPU->host RAM instead of OOM
+#   XLA_CLIENT_MEM_FRACTION={XLA_MEM_FRAC}
+#                                        - lets the unified-memory pool grow to
+#                                          {XLA_MEM_FRAC}x the GPU (e.g. 3.2 ->
+#                                          ~128 GB effective on 40GB A100 with
+#                                          60GB host alloc); empirically passes
+#                                          for ~3100-residue large complexes.
+#                                          <=1500 res: 1.5 is plenty.
+#                                          >3500 res: switch flash_attn=xla and
+#                                          prefer A100-80GB if available.
+#
+# Wallclock note: JAX cold-start compile of the AF3 graph takes ~5-10 min on a
+# fresh node; the array scatters across nodes so every task pays it once.
+# Keep --time-infer >= 00:30:00 even for tiny test pairs.
+set -euo pipefail
+mkdir -p "{OUTDIR}/logs"
+
+module load {AF3_MODULE} || {{ echo "ERROR: module load {AF3_MODULE} failed" >&2; exit 3; }}
+: "${{ALPHAFOLD_BIN_DIR:?ALPHAFOLD_BIN_DIR unset — module load {AF3_MODULE} did not export it}}"
+: "${{ALPHAFOLD_DATABASES:?ALPHAFOLD_DATABASES unset — set db_dir in config.yaml or load the AF3 module}}"
+[ -r "$ALPHAFOLD_BIN_DIR/run_alphafold.py" ] || {{ echo "ERROR: $ALPHAFOLD_BIN_DIR/run_alphafold.py missing or unreadable" >&2; exit 4; }}
+
+# JAX/CUDA env — pin JAX to CUDA backend; defensive against PCIe enumeration
+# races when multiple GPUs are visible.
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=${{CUDA_VISIBLE_DEVICES:-0}}
+
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export TF_FORCE_UNIFIED_MEMORY=true
+# AF3's JAX (>=0.4.34) rejects setting both XLA_CLIENT_MEM_FRACTION and the
+# deprecated XLA_PYTHON_CLIENT_MEM_FRACTION at the same time. Only export the new name.
+unset XLA_PYTHON_CLIENT_MEM_FRACTION
+export XLA_CLIENT_MEM_FRACTION={XLA_MEM_FRAC}
+
+# SLURM_ARRAY_TASK_ID must be set.
+[ -n "${{SLURM_ARRAY_TASK_ID:-}}" ] || {{ echo "ERROR: SLURM_ARRAY_TASK_ID unset — submit with --array" >&2; exit 5; }}
+
+LIST="{LISTFILE}"
+J=$(sed -n "${{SLURM_ARRAY_TASK_ID}}p" "$LIST")
+if [ -z "$J" ] || [ ! -f "$J" ]; then
+    echo "ERROR: list line ${{SLURM_ARRAY_TASK_ID}} of $LIST -> '$J' (missing/empty)" >&2
+    exit 6
+fi
+name=$(basename "$J" .json)
+
+# AF3 lowercases the JSON "name" field when creating the output subdir.
+# Primary path is the deterministic lowercased mapping; fallback `find` catches
+# edge cases where AF3 sanitizes further (e.g. '.' -> '_') beyond simple casing.
+# Use an EXACT filename match in the fallback (`-name "${{lname}}_data.json"`)
+# rather than a loose `-path "*$lname*"` substring — prevents collision between
+# overlapping names like `ect2___caf1` vs `ect2___caf1a`.
+lname=$(echo "$name" | tr "[:upper:]" "[:lower:]")
+DATA="{OUTDIR}/out/$lname/${{lname}}_data.json"
+if [ ! -f "$DATA" ]; then
+    DATA=$(find "{OUTDIR}/out" -maxdepth 2 -type f -name "${{lname}}_data.json" -print -quit 2>/dev/null || true)
+fi
+if [ ! -f "$DATA" ]; then
+    echo "ERROR: no data.json for $name (lname=$lname) under {OUTDIR}/out" >&2
+    exit 2
+fi
+echo "NODE=$(hostname) TASK=$SLURM_ARRAY_TASK_ID DATA=$DATA NAME=$name CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+
+python "$ALPHAFOLD_BIN_DIR/run_alphafold.py" \
+    --json_path="$DATA" \
+    --db_dir="{DB_DIR}" \
+    --model_dir="{MODEL_DIR}" \
+    --output_dir="{OUTDIR}/out" \
+    --norun_data_pipeline \
+    --num_diffusion_samples={NUM_SAMPLES} \
+    --num_recycles={NUM_RECYCLES} \
+    --flash_attention_implementation={FLASH_ATTN} \
+    {AF3_INFER_EXTRA}
+
+rc=$?
+# Post-run sanity check: at least one model file must exist. Surfaces silent
+# inference no-ops (e.g. wrong flag set, JAX crash before write).
+if [ "$rc" -eq 0 ] && ! ls "{OUTDIR}/out/$lname/${{lname}}_model_"*.cif >/dev/null 2>&1; then
+    echo "ERROR: AF3 exited 0 but produced no model files for $lname" >&2
+    rc=7
+fi
+echo "AF3_INFER_EXIT=$rc name=$name"
+exit $rc

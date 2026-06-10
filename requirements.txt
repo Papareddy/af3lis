@@ -1,0 +1,8 @@
+numpy>=1.23
+scipy>=1.9
+pandas>=1.5
+matplotlib>=3.6
+# stdlib urllib is used for UniProt fetch (no 'requests' dependency)
+# AlphaFold 3 itself runs on the cluster via the bio/alphafold/3.0.1 module
+# (with $HOME/af3-models for the gated DeepMind weights) — not a pip dep here.
+# lis.py is vendored verbatim from boltzlis and needs only numpy/scipy/pandas.

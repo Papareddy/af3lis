@@ -1,0 +1,59 @@
+#!/bin/bash
+#SBATCH -J {JOBNAME}_align
+#SBATCH -p {ALIGN_PARTITION}
+#SBATCH --time={ALIGN_TIME}
+#SBATCH --mem={ALIGN_MEM}
+#SBATCH --cpus-per-task={ALIGN_CPUS}
+#SBATCH -o {OUTDIR}/logs/align_%A_%a.out
+# stderr merges into stdout (single -o, no -e) — avoids inode-race truncation
+# seen on some SLURM versions when -o and -e point at the same file.
+# AF3 stage 1: CPU MSA + templates only (no inference).
+# Submit:
+#   sbatch --array=1-{NJOBS} {OUTDIR}/align.sbatch
+#
+# Reads one input JSON per array task from {LISTFILE} (1 line = 1 absolute JSON path).
+# Writes augmented <out>/<lname>/<lname>_data.json that stage 2 (af3_infer) consumes.
+set -euo pipefail
+mkdir -p "{OUTDIR}/logs" "{OUTDIR}/out"
+
+# Surface module-load failures unambiguously. `module` is a shell function on
+# bwHPC; without explicit `|| exit` a failure prints to stderr and we'd press
+# on with $ALPHAFOLD_BIN_DIR unset, hitting a cryptic "file not found" later.
+module load {AF3_MODULE} || {{ echo "ERROR: module load {AF3_MODULE} failed" >&2; exit 3; }}
+: "${{ALPHAFOLD_BIN_DIR:?ALPHAFOLD_BIN_DIR unset — module load {AF3_MODULE} did not export it}}"
+: "${{ALPHAFOLD_DATABASES:?ALPHAFOLD_DATABASES unset — set db_dir in config.yaml or load the AF3 module}}"
+
+# SLURM_ARRAY_TASK_ID must be set (i.e. submitted with --array).
+[ -n "${{SLURM_ARRAY_TASK_ID:-}}" ] || {{ echo "ERROR: SLURM_ARRAY_TASK_ID unset — submit with --array" >&2; exit 4; }}
+
+LIST="{LISTFILE}"
+J=$(sed -n "${{SLURM_ARRAY_TASK_ID}}p" "$LIST")
+if [ -z "$J" ] || [ ! -f "$J" ]; then
+    echo "ERROR: list line ${{SLURM_ARRAY_TASK_ID}} of $LIST -> '$J' (missing/empty)" >&2
+    exit 2
+fi
+name=$(basename "$J" .json)
+lname=$(echo "$name" | tr "[:upper:]" "[:lower:]")
+echo "NODE=$(hostname) TASK=${{SLURM_ARRAY_TASK_ID}} JSON=$J NAME=$name LNAME=$lname"
+
+# Stale-output guard: if the output dir exists but has no _data.json, the
+# previous attempt died mid-MSA. Clean it so AF3 will start fresh rather
+# than silently no-op'ing.
+if [ -d "{OUTDIR}/out/$lname" ] && [ ! -f "{OUTDIR}/out/$lname/${{lname}}_data.json" ]; then
+    echo "WARNING: stale partial output dir for $name — removing {OUTDIR}/out/$lname" >&2
+    rm -rf "{OUTDIR}/out/$lname"
+fi
+
+python "$ALPHAFOLD_BIN_DIR/run_alphafold.py" \
+    --json_path="$J" \
+    --db_dir="{DB_DIR}" \
+    --model_dir="{MODEL_DIR}" \
+    --output_dir="{OUTDIR}/out" \
+    --norun_inference \
+    --jackhmmer_n_cpu={ALIGN_CPUS} \
+    --nhmmer_n_cpu={ALIGN_CPUS} \
+    {AF3_DATA_EXTRA}
+
+rc=$?
+echo "AF3_ALIGN_EXIT=$rc name=$name"
+exit $rc
