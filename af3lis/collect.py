@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from . import af3_io
+from . import ipsae_runner
 from . import structure as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +41,12 @@ AGG = [
     "ipSAE", "actifpTM", "ipTM", "pTM", "PEAK",
     "pLDDT_i", "pLDDT_j",
 ]
+
+# Dunbrack ipsae.py metric family (via ipsae_runner; from Mau's toolkit).
+# Appended to AGG when present -- the TSV carries OUR metrics AND these.
+# boltzlis-schema note: `--agg flat` stays byte-identical to boltzlis only
+# with --no-ipsae; with ipsae on, these columns are appended after PEAK/pLDDT.
+IPSAE_AGG = list(ipsae_runner.METRICS)
 
 # Join keys for merging PEAK back into the lis.py per-model table.
 KEYS = ["name", "chain_i", "chain_j"]
@@ -317,18 +324,25 @@ def collect_all(out_dir: str,
                 rank_by: str = "iLIS_max",
                 python_exe: Optional[str] = None,
                 lis_py: Optional[str] = None,
-                agg_mode: str = "per_seed") -> pd.DataFrame:
-    """Full pipeline: lis.py -> merge PEAK -> aggregate -> write TSV.
+                agg_mode: str = "per_seed",
+                ipsae: bool = True,
+                ipsae_pae_cutoff: float = 10.0,
+                ipsae_dist_cutoff: float = 10.0) -> pd.DataFrame:
+    """Full pipeline: lis.py -> merge PEAK -> merge ipsae.py -> aggregate -> TSV.
 
     Parameters
     ----------
     out_dir : AF3 output root (contains `<lname>/<lname>_model_<N>.cif` etc).
     out_tsv : output TSV path. Per-model CSV is written alongside as
               `<out_tsv>.permodel.csv` (carries residue-level LIR/cLIR).
-    workers : parallel workers for lis.py.
+    workers : parallel workers for lis.py and ipsae.py.
     rank_by : sort column. boltzlis names ('iLIS_max', 'PEAK_max') are
               auto-translated to per_seed equivalents.
     agg_mode : 'per_seed' (default) or 'flat'.
+    ipsae : also run the vendored Dunbrack ipsae.py and append its metric
+            family (ipSAE_d0res/d0chn/d0dom, ipTM_d0chn, pDockQ, pDockQ2,
+            LIS_ipsae). Disable with --no-ipsae for byte-identical boltzlis
+            schema in --agg flat.
     """
     if agg_mode not in ("per_seed", "flat"):
         raise ValueError(
@@ -392,6 +406,31 @@ def collect_all(out_dir: str,
     # the permodel CSV so the persisted per-row table carries provenance.
     lis = _attach_seed_sample(lis, peak)
 
+    # ---- merge the Dunbrack ipsae.py metric family (from Mau's toolkit) ----
+    # Same (name, rank, chain_i, chain_j) key as the PEAK merge; ipsae_runner
+    # already emits rank == f"{seed}_{sample}" and one row per unordered pair.
+    if ipsae:
+        ips = ipsae_runner.run_ipsae(
+            out_dir, workers=workers,
+            pae_cutoff=ipsae_pae_cutoff, dist_cutoff=ipsae_dist_cutoff,
+            python_exe=python_exe)
+        if not ips.empty:
+            ij = np.sort(ips[["chain_i", "chain_j"]].astype(str).to_numpy(),
+                         axis=1)
+            ips["chain_i"] = ij[:, 0]
+            ips["chain_j"] = ij[:, 1]
+            ips["rank"] = ips["rank"].astype(str)
+            lis = lis.assign(rank=lis["rank"].astype(str)).merge(
+                ips, on=["name", "rank", "chain_i", "chain_j"], how="left")
+            i_matched = int(lis[ipsae_runner.METRICS[0]].notna().sum())
+            sys.stderr.write(
+                f"[collect] ipsae rows={len(ips)}, matched {i_matched}/"
+                f"{len(lis)} lis rows\n")
+        else:
+            sys.stderr.write(
+                "[collect] WARNING: ipsae.py produced no rows (missing "
+                "confidences.json? monomers only?) -- ipsae columns skipped.\n")
+
     # Persist the full per-model CSV (with PEAK + seed/sample) — this is the
     # consumer-facing artifact. Write it BEFORE the chain_i!=chain_j filter
     # so monomer self-pairs are preserved for diagnostic use.
@@ -402,7 +441,7 @@ def collect_all(out_dir: str,
     # Drop self-pairs (monomers / diagonal) before aggregation.
     lis = lis[lis["chain_i"] != lis["chain_j"]].copy()
 
-    have = [c for c in AGG if c in lis.columns]
+    have = [c for c in AGG + IPSAE_AGG if c in lis.columns]
 
     # ---- aggregate ----
     if agg_mode == "flat":
@@ -465,7 +504,16 @@ def main() -> None:
                          "(default: iLIS_max -> iLIS_max_max).")
     ap.add_argument("--agg", choices=("per_seed", "flat"), default="per_seed",
                     help="Aggregation mode. 'per_seed' (default) emits 4 columns "
-                         "per metric; 'flat' is byte-identical to boltzlis schema.")
+                         "per metric; 'flat' is byte-identical to boltzlis schema "
+                         "(only with --no-ipsae).")
+    ap.add_argument("--no-ipsae", action="store_true",
+                    help="Skip the Dunbrack ipsae.py metric family "
+                         "(ipSAE_d0res/d0chn/d0dom, ipTM_d0chn, pDockQ, pDockQ2, "
+                         "LIS_ipsae).")
+    ap.add_argument("--ipsae-pae-cutoff", type=float, default=10.0,
+                    help="ipsae.py PAE cutoff (default 10).")
+    ap.add_argument("--ipsae-dist-cutoff", type=float, default=10.0,
+                    help="ipsae.py CB-CB distance cutoff for pDockQ (default 10).")
     a = ap.parse_args()
 
     agg = collect_all(
@@ -475,6 +523,9 @@ def main() -> None:
         python_exe=a.python,
         lis_py=a.lis,
         agg_mode=a.agg,
+        ipsae=not a.no_ipsae,
+        ipsae_pae_cutoff=a.ipsae_pae_cutoff,
+        ipsae_dist_cutoff=a.ipsae_dist_cutoff,
     )
 
     print(f"wrote {a.output}  ({len(agg)} pairs)")
@@ -487,6 +538,7 @@ def main() -> None:
         "PEAK_max_max", "PEAK_max",
         "actifpTM_max_max", "actifpTM_max",
         "ipSAE_max_max", "ipSAE_max",
+        "pDockQ_max_max", "pDockQ_max",
     ) if c in agg.columns]
     if preview_cols:
         print(agg[preview_cols].head(15).to_string(index=False))

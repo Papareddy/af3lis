@@ -21,6 +21,11 @@ aggregated per-seed-then-cross over diffusion samples. The output TSV schema is
 **byte-identical to boltzlis** in `--agg flat` mode, so the same beeswarm plotter and
 PEAK-ranking convention work across engines.
 
+### Reading the metrics — PEAK vs actifpTM vs iLIS (+ a scipy gotcha)
+- **PEAK and actifpTM are both *confidence* axes and tend to correlate** (PEAK = 1−min-interchain-PAE/30; actifpTM = interface-restricted ipTM). A high value on either means a *locally* confident contact — but a few low-PAE residues can inflate PEAK/actifpTM even when no real interface forms.
+- **iLIS is the orthogonal check** — it scores interface contact *extent/density*, so it is **not** inflated by a tiny confident contact. A **high-PEAK / low-iLIS** fold is the signature of a small or spurious interface. Require **both** (house bar: PEAK ≥ 0.7 *and* iLIS ≥ 0.22); treat single-metric (PEAK-only) hits as provisional, and prefer multi-seed + cross-engine (Boltz↔AF3) agreement.
+- **iLIS needs `scipy`.** `lis.py` imports `scipy.spatial.distance`; if the collect Python lacks scipy, **lis.py fails silently** — `metrics.tsv` comes back with PEAK populated but **iLIS empty/zero**, and `collect` still exits 0. Always collect with a numpy + **scipy** + pandas env and sanity-check that the iLIS column is non-empty.
+
 > **What this is.** `af3lis` is a thin **orchestration wrapper** -- built by
 > **Ranjith Papareddy** -- that runs **AlphaFold 3** for structure prediction and computes
 > *published* interface-confidence metrics (**LIS / iLIS**, **actifpTM**, **ipSAE**, **PEAK**).
@@ -169,6 +174,46 @@ Useful submit flags:
 > JAX cold-start compiles the model graph (~5-10 min/node) on the first job of every node
 > -- bake into wallclock estimates even for tiny test pairs.
 
+### 3b. PACKED inference -- recommended for >~30 folds on low fairshare
+
+Packing strategy after **Mau's bwHelix AF3 pipeline toolkit** (Aug 2026). The per-task
+array is the wrong shape on a scarce-GPU, low-fairshare account: bwHelix accrues age
+priority on only ~100 jobs (`MaxJobsAccruePU=100`), backfill-tests 128 per cycle, and
+**array tasks forfeit their accrued age** -- while every task re-pays weights-load + XLA
+compile (~5-10 min). Packed inference instead runs MANY `*_data.json` through ONE
+`run_alphafold.py --input_dir` process per job: weights load once, XLA compiles once per
+token bucket. `af3lis.pack` builds **single-bucket groups** sized to hit a target
+walltime (small complexes pack many per job, big ones few), so a job never blows its
+wallclock because sizes were mixed. Measured on bwHelix: a ~100-condition bucket-512
+screen ≈ 1 h in one packed job vs days queued as an array.
+
+```bash
+# after the ALIGN array completes, on the cluster:
+
+# (a) new size class or GPU? probe + calibrate first (one ~20-min GPU job):
+python pipeline.py --pack --probe 10 --outdir $WS/runs/UFM_screen
+bash $WS/runs/UFM_screen/af3pack_probe/submit_all.sh          # -> probe_out/ (isolated)
+python -m af3lis.calibrate $WS/runs/UFM_screen/logs/pack_*.out \
+       --out $WS/runs/UFM_screen/calib.json
+
+# (b) size + submit the campaign (auto-uses <outdir>/calib.json when present):
+python pipeline.py --pack --outdir $WS/runs/UFM_screen [--target-hours 1.5]
+bash $WS/runs/UFM_screen/af3pack/submit_all.sh
+# models -> out_pack/ (separate from out/, which holds the align-stage data JSONs);
+# collect exactly as in step 4 but on out_pack/
+```
+
+Pack mechanics worth knowing:
+- Groups are **symlinks** into `out/<lname>/` (`--pack-copy` to copy); conditions whose
+  align task failed are excluded and listed in `af3pack_missing.txt` (re-align, re-pack).
+- Walltimes come from a per-bucket seconds table; only buckets 512/768 were measured
+  (A100) -- **always probe + `--calib` for a new size class**. Safety margin `--safety 1.3`.
+- AF3 writes each condition's output as it finishes, so a timed-out group loses only its
+  un-run tail; the job log prints `MISSING: <lname>` lines for exactly those (delete those
+  partial dirs before re-running the group, else AF3 diverts to timestamped siblings).
+- Keep total pending jobs <= ~100; never `scancel` a pending job to retime it --
+  `scontrol update JobId=<id> TimeLimit=<minutes>` (decrease only) preserves accrued age.
+
 ### 4. Collect every metric -- Helix (one command)
 ```bash
 # after the array finishes (conda env 'analysis' carries numpy/scipy/pandas):
@@ -179,8 +224,16 @@ af3lis --collect $WS/runs/UFM_screen/out -o $WS/runs/UFM_screen/metrics.tsv -w 8
 ```
 `metrics.tsv` = one row per pair, ranked by `iLIS_max_max` (or `iLIS_max` in flat mode),
 with **per-seed-then-cross mean+max of every metric** (iLIS / LIS / cLIS / LIA / cLIA /
-ipSAE / actifpTM / ipTM / pTM / PEAK / pLDDT). The per-model CSV with residue-level LIR /
+ipSAE / actifpTM / ipTM / pTM / PEAK / pLDDT) **plus the Dunbrack `ipsae.py` family**
+(`ipSAE_d0res` / `ipSAE_d0chn` / `ipSAE_d0dom` / `ipTM_d0chn` / `pDockQ` / `pDockQ2` /
+`LIS_ipsae`; skip with `--no-ipsae`). The per-model CSV with residue-level LIR /
 cLIR lives alongside as `metrics.tsv.permodel.csv`.
+
+> Cross-check for free: our `lis.py`-derived `ipSAE` and `ipsae.py`'s `ipSAE_d0res` are
+> independent implementations of the same score -- they agree to ~1e-3 on the same model
+> (verified on ECT5 x NOT1-SH). A large disagreement = investigate the inputs.
+> `--agg flat` is byte-identical to the boltzlis schema **only with `--no-ipsae`**
+> (the ipsae columns are appended after pLDDT otherwise).
 
 Aggregation modes (`--agg`):
 
@@ -229,6 +282,7 @@ also produce.
 | `iLIA / LIA / cLIA` | derived from PAE + contacts | lis.py | interface residue counts |
 | `actifpTM` | derived from PAE + ipTM head | lis.py | recomputed per-interface |
 | `ipSAE` | derived from PAE (hardcoded cutoff 10) | lis.py | Dunbrack score |
+| `ipSAE_d0res/d0chn/d0dom`, `ipTM_d0chn`, `pDockQ`, `pDockQ2`, `LIS_ipsae` | per-sample `confidences.json` + `model.cif` | vendored `ipsae.py` (Dunbrack v3) via `ipsae_runner` | `max`-type row per chain pair; cutoffs `--ipsae-pae-cutoff 10 --ipsae-dist-cutoff 10`; from Mau's toolkit |
 | `LIR_i/j`, `cLIR_i/j` | per-model CSV only | lis.py | not in final TSV; same as boltzlis |
 | **PEAK** | `<lname>_full_data_<N>.json` -> `pae` + `token_chain_ids` | af3lis | `max(0, 1 - min(off-diag PAE block)/30)`; token-axis, matches AF3's native `chain_pair_pae_min` to JSON-rounding precision (~3e-4; unit-tested) |
 | `ranking_score`, `has_clash`, `fraction_disordered`, `chain_pair_pae_min` | `<lname>_summary_confidences_<N>.json` | af3_io (loaded, not in TSV) | available for downstream filtering / sanity checks |
@@ -248,12 +302,17 @@ af3lis/
   json_build.py                   chain-sets -> AF3 input JSON(s)  (grid | complex)
   structure.py                    CIF parser + token-axis PEAK chain split
   af3_io.py                       single source of truth for AF3 output paths + FoldResult
-  collect.py                      lis.py + PEAK -> ranked per-pair metric table
+  collect.py                      lis.py + PEAK + ipsae.py -> ranked per-pair metric table
                                   [af3lis collect ...   or   af3lis --collect ...]
   lis.py                          vendored AFM-LIS (iLIS/LIS/cLIS/LIA/ipSAE/actifpTM)
+  ipsae.py                        vendored Dunbrack ipsae.py v3 (ipSAE_d0*/pDockQ/pDockQ2)
+  ipsae_runner.py                 drives ipsae.py per sample, parses the max rows
+  pack.py                         packed-inference grouper (strategy after Mau's toolkit)
+  calibrate.py                    per-bucket seconds from a packed job log -> calib.json
 slurm/
   af3_align.sbatch.tmpl           CPU MSA stage
-  af3_infer.sbatch.tmpl           GPU inference stage (afterok chained)
+  af3_infer.sbatch.tmpl           GPU inference stage (afterok chained; per-task array)
+  af3_pack_infer.sbatch.tmpl      PACKED GPU inference (--input_dir; driven by af3pack/)
 pyproject.toml                    package metadata (entry point: af3lis -> pipeline.main)
 requirements.txt                  pinned numpy/scipy/pandas/matplotlib/pytest
 .gitignore                        excludes config.yaml + seq_cache + runs/
@@ -303,6 +362,8 @@ work, cite the underlying methods** (and a link to this repo is appreciated):
 | **iLIS / LIS / cLIS / LIA** | local interaction scores (vendored `lis.py`) | LIS+LIA: Kim *et al.* 2024, bioRxiv [10.1101/2024.02.19.580970](https://doi.org/10.1101/2024.02.19.580970) -- repo: [flyark/AFM-LIS](https://github.com/flyark/AFM-LIS). iLIS (sqrt(LIS*cLIS)) was introduced in the same line of work; confirm the exact iLIS citation/title at the upstream repo before publishing. |
 | **actifpTM** | interface-restricted ipTM | Varga, Ovchinnikov & Schueler-Furman 2025, *Bioinformatics* [10.1093/bioinformatics/btaf107](https://doi.org/10.1093/bioinformatics/btaf107) |
 | **ipSAE** | aligned-error interface score | Dunbrack 2025, bioRxiv [10.1101/2025.02.10.637595](https://doi.org/10.1101/2025.02.10.637595) |
+| **ipsae.py v3** (vendored) | ipSAE_d0res/d0chn/d0dom + pDockQ + pDockQ2 + LIS reference implementation | same Dunbrack 2025 preprint; script MIT-style (header retained). pDockQ: Bryant *et al.* 2022 [10.1038/s41467-022-28865-w](https://doi.org/10.1038/s41467-022-28865-w); pDockQ2: Zhu *et al.* 2023 [10.1093/bioinformatics/btad424](https://doi.org/10.1093/bioinformatics/btad424) |
+| **packed inference** | `--input_dir` batching + size-aware grouping + bwHelix queue playbook | strategy and measured queue numbers from **Mau's bwHelix AF3 pipeline toolkit** (personal communication, Aug 2026) -- ask before redistributing |
 | **ipTM / pTM** | confidence scalars reported by AF3 — pTM from Zhang & Skolnick 2004, ipTM from AlphaFold-Multimer | Evans *et al.* 2021 [10.1101/2021.10.04.463034](https://doi.org/10.1101/2021.10.04.463034) |
 
 `PEAK` ( = 1 - min-interchain-PAE/30 ) is a convenience scalar defined in this repo; no separate citation.

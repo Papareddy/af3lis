@@ -98,7 +98,11 @@ python "$ALPHAFOLD_BIN_DIR/run_alphafold.py" \
 rc=$?
 # Post-run sanity check: at least one model file must exist. Surfaces silent
 # inference no-ops (e.g. wrong flag set, JAX crash before write).
-if [ "$rc" -eq 0 ] && ! ls "{OUTDIR}/out/$lname/${{lname}}_model_"*.cif >/dev/null 2>&1; then
+# NB: when the align stage pre-populated out/<lname>/ with the MSA data.json, AF3
+# finds the dir non-empty and writes models to a TIMESTAMPED sibling dir
+# (out/<lname>_YYYYMMDD_HHMMSS/). collect.py is timestamp-aware, so search the whole
+# out/ tree for the model cif rather than only the canonical path.
+if [ "$rc" -eq 0 ] && [ -z "$(find "{OUTDIR}/out" -maxdepth 2 -name "${{lname}}_model*.cif" -print -quit 2>/dev/null)" ]; then
     echo "ERROR: AF3 exited 0 but produced no model files for $lname" >&2
     rc=7
 fi

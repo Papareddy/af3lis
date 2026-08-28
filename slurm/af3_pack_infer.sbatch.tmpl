@@ -1,0 +1,83 @@
+#!/bin/bash
+#SBATCH -J {JOBNAME}_pack
+#SBATCH -p {INFER_PARTITION}
+#SBATCH --gres={GPU_GRES}
+#SBATCH --time={INFER_TIME}
+#SBATCH --mem={INFER_MEM}
+#SBATCH --cpus-per-task={INFER_CPUS}
+#SBATCH -o {OUTDIR}/logs/pack_%x_%A.out
+# stderr merges into stdout (single -o, no -e) — same inode-race rationale as
+# the array templates. The merged log also carries AF3's per-condition
+# "Calculating bucket size" timestamps, which `python -m af3lis.calibrate`
+# parses for walltime calibration.
+#
+# af3lis -- PACKED AF3 GPU inference (packing strategy after Mau's bwHelix AF3
+# toolkit, Aug 2026). One job runs EVERY *_data.json in a group dir through a
+# single run_alphafold.py process: weights load once, XLA compiles once per
+# token bucket. Groups are built single-bucket by af3lis.pack, so each job
+# pays exactly one compile. Queue rationale: bwHelix accrues age on only ~100
+# jobs and array tasks forfeit age -- few fat jobs beat many tiny tasks.
+#
+# Args (from af3pack/submit_all.sh; walltime is overridden per group):
+#   $1 = GROUP_DIR  dir of *_data.json symlinks (one token bucket)
+#   $2 = OUT_ROOT   packed-campaign output root (out_pack/ -- NOT out/; keeping
+#                   it separate avoids AF3's timestamped-sibling-dir behavior
+#                   on the non-empty align dirs, and probe runs stay isolated)
+#
+# Re-running a failed/timed-out group: AF3 wrote every FINISHED condition to
+# OUT_ROOT already. Delete the partial dirs named in this log's MISSING lines
+# before resubmitting, or AF3 will divert them to timestamped sibling dirs.
+set -uo pipefail
+mkdir -p "{OUTDIR}/logs"
+
+module load {AF3_MODULE} || {{ echo "ERROR: module load {AF3_MODULE} failed" >&2; exit 3; }}
+: "${{ALPHAFOLD_BIN_DIR:?ALPHAFOLD_BIN_DIR unset — module load {AF3_MODULE} did not export it}}"
+: "${{ALPHAFOLD_DATABASES:?ALPHAFOLD_DATABASES unset — set db_dir in config.yaml or load the AF3 module}}"
+[ -r "$ALPHAFOLD_BIN_DIR/run_alphafold.py" ] || {{ echo "ERROR: $ALPHAFOLD_BIN_DIR/run_alphafold.py missing or unreadable" >&2; exit 4; }}
+
+GROUP_DIR="${{1:?usage: sbatch af3_pack_infer.sbatch GROUP_DIR OUT_ROOT}}"
+OUT_ROOT="${{2:?usage: sbatch af3_pack_infer.sbatch GROUP_DIR OUT_ROOT}}"
+mkdir -p "$OUT_ROOT"
+
+# JAX/CUDA env — identical to the per-task infer template (empirically tuned
+# on Helix A100-40GB; unified memory is what clears the ~3000-residue class).
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=${{CUDA_VISIBLE_DEVICES:-0}}
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export TF_FORCE_UNIFIED_MEMORY=true
+unset XLA_PYTHON_CLIENT_MEM_FRACTION
+export XLA_CLIENT_MEM_FRACTION={XLA_MEM_FRAC}
+
+# -L: group members are symlinks into out/<lname>/
+n=$(find -L "$GROUP_DIR" -maxdepth 1 -name '*_data.json' | wc -l)
+[ "$n" -gt 0 ] || {{ echo "ERROR: no *_data.json in $GROUP_DIR" >&2; exit 6; }}
+echo "PACK_START n=$n group=$GROUP_DIR out=$OUT_ROOT node=$(hostname) date=$(date '+%F %T')"
+
+python "$ALPHAFOLD_BIN_DIR/run_alphafold.py" \
+    --input_dir="$GROUP_DIR" \
+    --db_dir="{DB_DIR}" \
+    --model_dir="{MODEL_DIR}" \
+    --output_dir="$OUT_ROOT" \
+    --norun_data_pipeline \
+    --num_diffusion_samples={NUM_SAMPLES} \
+    --num_recycles={NUM_RECYCLES} \
+    --flash_attention_implementation={FLASH_ATTN} \
+    {AF3_INFER_EXTRA}
+rc=$?
+
+# Per-condition completion check: AF3 writes OUT_ROOT/<lname>/<lname>_model.cif
+# as each condition finishes, so after a timeout this lists exactly the un-run
+# tail. Never trust the exit code alone (Mau's trap #1 generalizes).
+done_n=0; miss_n=0
+for f in "$GROUP_DIR"/*_data.json; do
+    lname=$(basename "$f" _data.json)
+    if [ -n "$(find "$OUT_ROOT/$lname" -maxdepth 1 -name "${{lname}}_model*.cif" -print -quit 2>/dev/null)" ]; then
+        done_n=$((done_n+1))
+    else
+        echo "MISSING: $lname"
+        miss_n=$((miss_n+1))
+    fi
+done
+echo "PACK_DONE rc=$rc done=$done_n missing=$miss_n date=$(date '+%F %T')"
+[ "$rc" -eq 0 ] && [ "$miss_n" -gt 0 ] && rc=7
+exit $rc

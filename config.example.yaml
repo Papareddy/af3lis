@@ -34,8 +34,14 @@ align_cpus: 16
 align_extra: ""
 
 # ----- SLURM: inference stage (GPU diffusion) -----
+# These settings feed BOTH infer routes: the per-task array (infer.sbatch) and
+# packed inference (pack_infer.sbatch; `pipeline.py --pack` after align --
+# recommended for big screens on low fairshare; packed jobs get their walltime
+# from the pack sizing, not infer_time).
 infer_partition: gpu-single
 # Helix-specific GRES; use 'gpu:1' for generic SLURM.
+# NB bwHelix + A100: asking >=64G memory excludes the 26 abundant 40GB gpu4
+# nodes and restricts you to 4 scarce gpu8 nodes -- keep 48-60gb unless needed.
 infer_gpu_gres: gpu:A100:1
 # Minimum GPU memory hint (informational; SLURM gres carries the real constraint).
 # A100-40GB clears ~3100-residue complexes with xla_mem_frac >= 3.0; for >3500

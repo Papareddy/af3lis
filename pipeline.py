@@ -29,7 +29,15 @@ python pipeline.py --name UFM_screen --chainA UFL1 --chainB DDRGK1 \
 # submit the two-stage array (CPU MSA -> GPU infer chained on afterok)
 python pipeline.py --submit --outdir runs/UFM_screen
 
-# just (re)collect metrics for a finished AF3 out dir
+# PACKED inference (recommended for big screens on low fairshare): after the
+# align array completes, group predictions into few fat single-bucket GPU jobs
+# (strategy after Mau's bwHelix AF3 toolkit; see af3lis/pack.py)
+python pipeline.py --pack --outdir runs/UFM_screen        # -> af3pack/submit_all.sh
+python pipeline.py --pack --probe 10 --outdir runs/UFM_screen   # calibration probe
+
+# just (re)collect metrics for a finished AF3 out dir (array route: out/,
+# packed route: out_pack/). Emits our metric set + the Dunbrack ipsae.py
+# family (pDockQ/pDockQ2/ipSAE_d0*) unless --no-ipsae.
 python pipeline.py --collect runs/UFM_screen/out -o runs/UFM_screen/metrics.tsv
 """
 from __future__ import annotations
@@ -51,6 +59,7 @@ from af3lis.collect import collect_all
 HERE = os.path.dirname(os.path.abspath(__file__))
 TMPL_ALIGN = os.path.join(HERE, "slurm", "af3_align.sbatch.tmpl")
 TMPL_INFER = os.path.join(HERE, "slurm", "af3_infer.sbatch.tmpl")
+TMPL_PACK = os.path.join(HERE, "slurm", "af3_pack_infer.sbatch.tmpl")
 
 # Sentinel for argparse defaults — distinguishes "user didn't pass --seeds"
 # from "user passed --seeds 1". Lets us source seeds from config.yaml when
@@ -211,22 +220,22 @@ def render_sbatches(jobs: list[tuple[str, str]],
 
     align_sb = os.path.join(outdir, "align.sbatch")
     infer_sb = os.path.join(outdir, "infer.sbatch")
-    if not os.path.exists(TMPL_ALIGN):
-        raise FileNotFoundError(
-            f"align sbatch template missing: {TMPL_ALIGN}"
-        )
-    if not os.path.exists(TMPL_INFER):
-        raise FileNotFoundError(
-            f"infer sbatch template missing: {TMPL_INFER}"
-        )
+    pack_sb = os.path.join(outdir, "pack_infer.sbatch")
+    for tmpl in (TMPL_ALIGN, TMPL_INFER, TMPL_PACK):
+        if not os.path.exists(tmpl):
+            raise FileNotFoundError(f"sbatch template missing: {tmpl}")
     rendered_align = _render_template(TMPL_ALIGN, align_map)
     rendered_infer = _render_template(TMPL_INFER, infer_map)
+    # Packed template takes GROUP_DIR/OUT_ROOT as $1/$2 at submit time (from
+    # af3pack/submit_all.sh) — it shares the infer map (env, module, flags).
+    rendered_pack = _render_template(TMPL_PACK, infer_map)
     # Renderer sanity check: no unsubstituted `{PLACEHOLDER}` should remain.
     # Catches typos in template keys before they hit SLURM. Bash variables
     # like ${VAR} are NOT placeholders — we only flag standalone `{NAME}`
     # NOT preceded by `$`.
     import re as _re
-    for tag, text in (("align", rendered_align), ("infer", rendered_infer)):
+    for tag, text in (("align", rendered_align), ("infer", rendered_infer),
+                      ("pack", rendered_pack)):
         leftover = _re.findall(r"(?<![\$])\{[A-Z_]+\}", text)
         if leftover:
             raise ValueError(
@@ -236,6 +245,8 @@ def render_sbatches(jobs: list[tuple[str, str]],
         fh.write(rendered_align)
     with open(infer_sb, "w") as fh:
         fh.write(rendered_infer)
+    with open(pack_sb, "w") as fh:
+        fh.write(rendered_pack)
     return align_sb, infer_sb, listfile
 
 
@@ -277,6 +288,25 @@ def write_runbook(outdir: str,
         "# add --dry-run to see the exact sbatch commands without launching\n"
         "# add --align-only / --infer-only to run a single stage\n"
         "```\n\n"
+        "## PACKED inference (RECOMMENDED for >~30 folds on low fairshare)\n"
+        "Replaces stage 2 only (align stays an array). Packs many predictions\n"
+        "into few fat jobs via AF3 `--input_dir`: weights load once, XLA\n"
+        "compiles once per token bucket, and the jobs sit inside bwHelix's\n"
+        "~100-job age-accrue window instead of forfeiting age as array tasks.\n"
+        "(Strategy after Mau's bwHelix AF3 toolkit.)\n"
+        "```bash\n"
+        "# after the ALIGN array completes, ON THE CLUSTER:\n"
+        "# (a) new size class or GPU? probe + calibrate first:\n"
+        "python %s/pipeline.py --pack --probe 10 --outdir %s %s\n"
+        "bash %s/af3pack_probe/submit_all.sh\n"
+        "#     ...when it finishes:\n"
+        "python -m af3lis.calibrate %s/logs/pack_*.out --out %s/calib.json\n"
+        "# (b) size + submit the campaign (uses calib.json if present):\n"
+        "python %s/pipeline.py --pack --outdir %s %s\n"
+        "bash %s/af3pack/submit_all.sh\n"
+        "# models land in out_pack/ -> collect with:\n"
+        "python %s/pipeline.py --collect %s/out_pack -o %s/metrics.tsv %s\n"
+        "```\n\n"
         "## Rerunning inference only (e.g. flash-attn miscompile)\n"
         "```bash\n"
         "python %s/pipeline.py --submit --infer-only --outdir %s %s\n"
@@ -293,6 +323,13 @@ def write_runbook(outdir: str,
            len(jobs), os.path.basename(infer_sb),
            HERE, abs_out, abs_out, cfg_arg,
            HERE, abs_out, cfg_arg,
+           # packed-inference section
+           HERE, abs_out, cfg_arg,          # --pack --probe
+           abs_out,                          # bash af3pack_probe/submit_all.sh
+           abs_out, abs_out,                 # calibrate log -> calib.json
+           HERE, abs_out, cfg_arg,           # --pack
+           abs_out,                          # bash af3pack/submit_all.sh
+           HERE, abs_out, abs_out, cfg_arg,  # collect out_pack
            HERE, abs_out, cfg_arg)
     )
     with open(runbook, "w") as fh:
@@ -512,6 +549,26 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--time-infer", default=None,
                     help="override infer wallclock (e.g. 06:00:00 for large >2500-res complexes)")
 
+    # pack (packed GPU inference -- strategy after Mau's bwHelix AF3 toolkit)
+    ap.add_argument("--pack", action="store_true",
+                    help="group align-stage *_data.json into few fat "
+                         "single-bucket GPU jobs (af3pack/ + submit_all.sh). "
+                         "Run AFTER the align array, on the cluster.")
+    ap.add_argument("--target-hours", type=float, default=1.5,
+                    help="with --pack: aim each packed job near this walltime")
+    ap.add_argument("--safety", type=float, default=1.3,
+                    help="with --pack: walltime margin on the estimate")
+    ap.add_argument("--calib", default=None,
+                    help="with --pack: calib.json from `python -m af3lis.calibrate` "
+                         "(defaults to <outdir>/calib.json when present)")
+    ap.add_argument("--pack-max-jobs", type=int, default=90,
+                    help="with --pack: warn above this many jobs (~100 accrue age)")
+    ap.add_argument("--pack-copy", action="store_true",
+                    help="with --pack: copy data JSONs into groups (default symlink)")
+    ap.add_argument("--probe", type=int, default=0, metavar="N",
+                    help="with --pack: build ONE probe group of N modal-bucket "
+                         "conditions (separate out root) for calibration")
+
     # collect
     ap.add_argument("--collect", metavar="OUT_DIR",
                     help="skip build; just collect metrics for this AF3 out dir")
@@ -523,7 +580,14 @@ def _build_argparser() -> argparse.ArgumentParser:
                          "(boltzlis 'iLIS_max' auto-translates in per_seed mode)")
     ap.add_argument("--agg", choices=["per_seed", "flat"], default="per_seed",
                     help="aggregation mode (default per_seed; 'flat' matches "
-                         "boltzlis TSV schema byte-for-byte for cross-engine plots)")
+                         "boltzlis TSV schema byte-for-byte for cross-engine plots "
+                         "-- only with --no-ipsae)")
+    ap.add_argument("--no-ipsae", action="store_true",
+                    help="with --collect: skip the Dunbrack ipsae.py metric "
+                         "family (ipSAE_d0res/d0chn/d0dom, ipTM_d0chn, pDockQ, "
+                         "pDockQ2, LIS_ipsae)")
+    ap.add_argument("--ipsae-pae-cutoff", type=float, default=10.0)
+    ap.add_argument("--ipsae-dist-cutoff", type=float, default=10.0)
     ap.add_argument("--lis-py", default=None, help="override vendored lis.py path")
     ap.add_argument("--python", default=None, help="override analysis python")
     # boltzlis-CLI parity: accept and ignore (AF3 only emits CIF).
@@ -550,8 +614,27 @@ def main() -> None:
         python_exe = a.python or cfg.get("python")
         agg = collect_all(a.collect, out, workers=a.workers,
                           rank_by=a.rank_by, python_exe=python_exe,
-                          lis_py=a.lis_py, agg_mode=a.agg)
+                          lis_py=a.lis_py, agg_mode=a.agg,
+                          ipsae=not a.no_ipsae,
+                          ipsae_pae_cutoff=a.ipsae_pae_cutoff,
+                          ipsae_dist_cutoff=a.ipsae_dist_cutoff)
         print("wrote %s (%d pairs)" % (out, len(agg)))
+        return
+
+    # ---- pack short-circuit ----
+    if a.pack:
+        if not a.outdir:
+            ap.error("--pack requires --outdir")
+        from af3lis.pack import cmd_pack
+        calib = a.calib
+        if calib is None:
+            default_calib = os.path.join(a.outdir, "calib.json")
+            if os.path.exists(default_calib):
+                calib = default_calib
+                print("[pack] using %s" % default_calib)
+        cmd_pack(a.outdir, target_hours=a.target_hours, safety=a.safety,
+                 calib_path=calib, max_jobs=a.pack_max_jobs,
+                 copy=a.pack_copy, probe=a.probe)
         return
 
     # ---- submit short-circuit ----
