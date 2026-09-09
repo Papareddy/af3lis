@@ -1,0 +1,18 @@
+# Expected outcome for each pair in examples/smoke.tsv.
+# `af3lis.sh check` reads this and asserts the positives outscore the negatives.
+# A failure means either the pipeline is wrong OR AF3 missed a known complex --
+# open figures/pae/<pair>.png to tell them apart.
+#
+# chainA	chainB	expect	basis
+UBE2N	UBE2V2	positive	obligate Ubc13-Mms2 heterodimer; crystal structure PDB 1J7D
+UBIQ	RAD23B	positive	RAD23B UBA domains are canonical ubiquitin receptors; PDB 1P98
+UBIQ	SQSTM1	positive	p62 C-terminal UBA binds ubiquitin; PDB 2K0B
+UBE2N	RAD23B	negative	no established direct interaction
+UBE2N	SQSTM1	negative	no established direct interaction
+UBE2N	SUMO1	negative	SUMO is not a Ubc13 partner
+UBE2N	P61956	negative	SUMO2 is not a Ubc13 partner
+UBE2N	NEDD8	negative	NEDD8 is not a Ubc13 partner
+UBIQ	UBE2V2	negative	Mms2 UEV binds Ubc13, not free ubiquitin
+UBIQ	SUMO1	negative	no canonical ubiquitin-SUMO1 interface
+UBIQ	P61956	negative	no canonical ubiquitin-SUMO2 interface
+UBIQ	NEDD8	negative	no canonical ubiquitin-NEDD8 interface

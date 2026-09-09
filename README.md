@@ -268,22 +268,43 @@ bash af3lis.sh smoke            # 12 folds from examples/smoke.tsv
 bash af3lis.sh check smoke      # 13 assertions; exits non-zero if anything is missing
 ```
 
-`examples/smoke.tsv` is 2 baits × 6 preys of small reviewed UniProt entries
-(81–409 aa, lengths verified against UniProt so none is a merged accession that
-resolves to an empty sequence). Pair sizes span 182–504 tokens, so grouping has
-to handle two token buckets. Alignment dominates the wall clock; inference is
-minutes.
+`examples/smoke.tsv` is 2 baits × 6 preys, and it is **not only a plumbing
+test**: three of the twelve pairs are interactions with solved structures and
+nine have no established interaction, declared in
+`examples/smoke_controls.tsv`.
 
-`check` asserts inputs were built, MSAs landed, models and confidences exist,
-PDBs were exported, `metrics.tsv` has rows, figures and PAE panels were
-written, packed groups were built, and — importantly — that the `iLIS`, `PEAK`
-and `ipTM` columns are actually **populated**. That last one catches the silent
-failure mode described in [Reading the metrics](#reading-the-metrics), where a
-scipy-less interpreter yields an empty iLIS column rather than an error.
+| pair | expect | basis |
+|---|---|---|
+| UBE2N × UBE2V2 | **positive** | obligate Ubc13–Mms2 heterodimer, PDB 1J7D |
+| UBIQ × RAD23B | **positive** | RAD23B UBA domains are canonical ubiquitin receptors, PDB 1P98 |
+| UBIQ × SQSTM1 | **positive** | p62 C-terminal UBA binds ubiquitin, PDB 2K0B |
+| the other 9 | negative | no established direct interaction |
 
-**Also test the failure path.** The `afterany` design is only worth having if it
-does what it claims, and its failure mode is silent, so prove it once: after the
-align array finishes and before the bridge job starts, delete one pair's MSA
+This matters because a pipeline can complete end to end and produce
+confidently **wrong** numbers — chains swapped, the wrong chain pair scored,
+PAE transposed — and a plumbing-only test would pass it. `check` therefore also
+asserts that the positives outscore the negatives on average and that the
+top-ranked pair is one of the positives. A controls failure is either a
+pipeline bug or AF3 missing a known complex; the message says so and points you
+at `figures/pae/<pair>.png` to tell them apart.
+
+Sequences ship in `examples/smoke.fasta`, so the test is deterministic and runs
+offline — a UniProt outage should not break your does-my-cluster-work test.
+SUMO2 is deliberately left out of the FASTA and given as a bare accession, so
+the UniProt fetch path and `seq_cache` are exercised on every run. Pair sizes
+span 157–592 tokens across three token buckets (256/512/768); the longest chain
+is 440 aa, so the MSAs are quick.
+
+`check` also asserts inputs were built, MSAs landed, models and confidences
+exist, PDBs were exported, `metrics.tsv` has rows, figures and PAE panels were
+written, packed groups were built, and that the `iLIS`, `PEAK` and `ipTM`
+columns are actually **populated** — that last one catches the silent failure
+described in [Reading the metrics](#reading-the-metrics), where a scipy-less
+interpreter yields an empty iLIS column rather than an error.
+
+**Also test the failure path.** The `afterany` design is only worth having if
+it does what it claims, and its failure mode is silent, so prove it once: after
+the align array finishes and before the bridge starts, delete one pair's MSA
 directory. The bridge should exclude it and print a `MISSING:` line, and the
 analyse job should still score the other 11.
 

@@ -1,29 +1,28 @@
-# af3lis smoke test -- 2 baits x 6 preys = 12 folds.
+# af3lis smoke test -- 2 baits x 6 preys = 12 folds, WITH CONTROLS.
 #
-# Purpose: prove the whole chain works on a new cluster before spending real
-# GPU hours. Every accession below is reviewed (sp|) and its length was
-# verified against UniProt, so the MSAs come back quickly and no entry is a
-# redirect or a merged accession that resolves to an empty sequence.
+# Not only a plumbing test. Three of the twelve pairs are interactions with
+# solved structures and nine have no established interaction, so a run that
+# completes but gets the biology backwards -- chains swapped, wrong chain pair
+# scored, PAE transposed -- is caught instead of passing silently.
+# `af3lis.sh check` asserts the positives outscore the negatives.
+# Expected outcome per pair: examples/smoke_controls.tsv
 #
-# What it does and does NOT cover:
-#   covered      -- UniProt fetch + seq_cache, TSV parsing, grid build, align
-#                   array, bridge grouping across TWO token buckets (256 and
-#                   512), packed GPU inference, collect, figures, PDB export,
-#                   and the afterany chain.
-#   NOT covered  -- the >=4096-token memory tier in the resource ladder. Hitting
-#                   it needs a ~1500 aa partner, which is no longer a "small
-#                   job"; that branch is covered by
-#                   tests/test_pack.py::test_resources_for_ladder instead.
+# Sequences come from examples/smoke.fasta, so the test is deterministic and
+# runs offline. P61956 (SUMO2) is deliberately given as a BARE ACCESSION so the
+# UniProt fetch path and seq_cache are still exercised on every run.
 #
-# Pair sizes run 182-504 tokens, so you should see 2 buckets in
-# af3pack/groups.tsv, both on the 48gb tier (that is correct, not a bug).
+# Sizes: pair totals 157-592 tokens, spanning three token buckets (256/512/768);
+# longest chain 440 aa, so the MSAs are quick.
 #
-# chain	id	# protein, verified length
-A	P61956	# SUMO2, 95 aa
-A	Q15843	# NEDD8, 81 aa
-B	P63165	# SUMO1, 101 aa
-B	P62987	# UBA52 / ubiquitin-eL40, 128 aa
-B	P61088	# UBE2N (Ubc13), 152 aa
-B	P62837	# UBE2D2, 147 aa
-B	P0CG47	# polyubiquitin-B, 229 aa
-B	P54727	# RAD23B, 409 aa
+# Run it with:
+#   bash af3lis.sh smoke
+#
+# chain	id	# note
+A	UBE2N	# Ubc13, 152 aa
+A	UBIQ	# ubiquitin monomer, 76 aa
+B	UBE2V2	# Mms2, 145 aa
+B	RAD23B	# 409 aa, two UBA domains
+B	SQSTM1	# p62, 440 aa, C-terminal UBA
+B	SUMO1	# 101 aa
+B	P61956	# SUMO2 -- bare accession on purpose: exercises UniProt fetch
+B	NEDD8	# 81 aa

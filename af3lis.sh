@@ -115,7 +115,8 @@ case "$CMD" in
     say "smoke run '$NAME' -> $D"
     say "12 folds (2 baits x 6 preys) from examples/smoke.tsv"
     "$PY" "$REPO/pipeline.py" --config "$CFG" --name "$NAME" --outdir "$D" \
-        --chains-tsv "$REPO/examples/smoke.tsv" "$@"
+        --chains-tsv "$REPO/examples/smoke.tsv" \
+        --fasta "$REPO/examples/smoke.fasta" "$@"
     "$PY" "$REPO/pipeline.py" --submit --outdir "$D" --config "$CFG"
     cat <<EOF
 
@@ -194,6 +195,81 @@ for m in ("iLIS", "PEAK", "ipTM"):
 PYCHK
       [ $? -ne 0 ] && fail=1 || true
     fi
+    # ---- CONTROLS: did it get the biology right, not just produce numbers? ----
+    CTL="$REPO/examples/smoke_controls.tsv"
+    if [ -s "$D/metrics.tsv" ] && [ -r "$CTL" ]; then
+      "$PY" - "$D/metrics.tsv" "$CTL" <<'PYCTL'
+import csv, sys, re, statistics as st
+metrics, ctlfile = sys.argv[1], sys.argv[2]
+rows = list(csv.DictReader(open(metrics), delimiter="\t"))
+if not rows:
+    sys.exit(0)
+cols = rows[0].keys()
+def col(m):
+    for c in (f"{m}_mean_mean", f"{m}_mean", m):
+        if c in cols:
+            return c
+ic = col("iLIS")
+if not ic:
+    sys.exit(0)
+
+def norm(n):
+    return re.sub(r"_\d{8}_\d{6}$", "", str(n)).lower()
+
+score = {}
+for r in rows:
+    try:
+        v = float(r[ic])
+    except (TypeError, ValueError):
+        continue
+    score[norm(r.get("name", ""))] = max(v, score.get(norm(r.get("name", "")), -1))
+
+ctl = [l.rstrip("\n").split("\t") for l in open(ctlfile)
+       if l.strip() and not l.startswith("#")]
+pos, neg, seen = [], [], 0
+print("  -- controls (declared in examples/smoke_controls.tsv) --")
+for a, b, expect, basis in ctl:
+    key = f"{a}___{b}".lower()
+    if key not in score:
+        continue
+    seen += 1
+    v = score[key]
+    (pos if expect == "positive" else neg).append((key, v))
+    mark = "+" if expect == "positive" else "-"
+    print(f"     {mark} {a+'x'+b:<18} iLIS {v:.3f}   {expect}")
+if seen == 0:
+    sys.exit(0)                      # not a smoke run; nothing to assert
+if not pos or not neg:
+    print("  \033[33mWARN\033[0m  controls incomplete -- cannot compare")
+    sys.exit(0)
+
+mp, mn = st.mean(v for _, v in pos), st.mean(v for _, v in neg)
+ok = True
+if mp > mn:
+    print(f"  \033[32mPASS\033[0m {'positives outscore negatives':<34} "
+          f"{mp:.3f} vs {mn:.3f}")
+else:
+    print(f"  \033[31mFAIL\033[0m {'positives outscore negatives':<34} "
+          f"{mp:.3f} vs {mn:.3f}")
+    ok = False
+top = max(score.items(), key=lambda kv: kv[1])[0]
+if top in dict(pos):
+    print(f"  \033[32mPASS\033[0m {'top-ranked pair is a positive':<34} {top}")
+else:
+    print(f"  \033[31mFAIL\033[0m {'top-ranked pair is a positive':<34} "
+          f"{top} ranked first")
+    ok = False
+for k, v in pos:
+    if v <= 0.23:
+        print(f"  \033[33mWARN\033[0m {k:<34} iLIS {v:.3f} below the 0.23 hit bar")
+if not ok:
+    print("  a controls failure is EITHER a pipeline bug OR AF3 missing a known")
+    print("  complex -- open figures/pae/<pair>.png to tell them apart.")
+sys.exit(0 if ok else 1)
+PYCTL
+      [ $? -ne 0 ] && fail=1 || true
+    fi
+
     echo
     # `|| true` matters: under `set -e -o pipefail` a grep with no matches
     # aborts the script -- which is precisely the case on a CLEAN run, so
