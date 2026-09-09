@@ -165,6 +165,51 @@ def test_submit_all_carries_per_group_resources():
     assert len(tsv[1].split("\t")) == len(tsv[0].split("\t")), "groups.tsv column mismatch"
 
 
+def test_chain_tsv_trailing_comments_and_forms():
+    """Annotated rows, whitespace separation, dedup, and the error paths."""
+    import tempfile, os
+    from af3lis.chain_input import read_chain_tsv
+    d = tempfile.mkdtemp()
+
+    def w(txt):
+        p = os.path.join(d, "c.tsv")
+        open(p, "w").write(txt)
+        return p
+
+    # trailing comments must not land in the sequence column
+    a, b, ov = read_chain_tsv(w(
+        "chain\tid\tsequence\n"
+        "A\tP0CG48\t# ubiquitin C, 76 aa\n"
+        "B\tP63165\t# SUMO1\n"))
+    assert (a, b) == ("P0CG48", "P63165"), (a, b)
+    assert ov == {}, ov
+
+    # inline sequence still works, and is upper-cased
+    _, _, ov = read_chain_tsv(w("A\tX\tmkvl\nB\tY\n"))
+    assert ov == {"X": "MKVL"}, ov
+
+    # whitespace-separated, no header, duplicate row dropped
+    a, b, _ = read_chain_tsv(w("A UFL1\nA UFL1\nB DDRGK1\nB CDK5RAP3\n"))
+    assert a == "UFL1" and b == "DDRGK1,CDK5RAP3", (a, b)
+
+    # one-sided input is refused rather than silently folding nothing
+    try:
+        read_chain_tsv(w("A\tX\nA\tY\n"))
+        raise AssertionError("one-sided TSV should be refused")
+    except SystemExit:
+        pass
+
+
+def test_smoke_fixture_parses():
+    """The shipped smoke fixture must stay valid -- it is the on-cluster test."""
+    import os
+    from af3lis.chain_input import read_chain_tsv
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    a, b, _ = read_chain_tsv(os.path.join(here, "examples", "smoke.tsv"))
+    na, nb = len(a.split(",")), len(b.split(","))
+    assert na == 2 and nb == 6, f"expected 2 baits x 6 preys, got {na}x{nb}"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

@@ -19,7 +19,8 @@ Accepted layout (tab-separated; a header row is optional and auto-detected)::
                   NOT looked up remotely, so offline runs and custom constructs
                   (truncations, mutants, tagged baits) work without a FASTA.
 
-Two-column files are fine. Blank lines and ``#`` comments are ignored.
+Two-column files are fine. Blank lines and ``#`` comments are ignored, including trailing comments
+after the data columns.
 Returns the two comma-separated specs the existing resolver already accepts,
 plus an overrides map that is merged into the ``--fasta`` overrides.
 """
@@ -71,6 +72,15 @@ def read_chain_tsv(path: str) -> tuple[str, str, dict[str, str]]:
             # spreadsheets and editors that expand tabs)
             cells = line.split("\t") if "\t" in line else line.split()
             cells = [c.strip() for c in cells]
+            # Trailing comments: a cell that STARTS with '#' begins a comment,
+            # so drop it and everything after. Without this an annotated row
+            # ("A<tab>P0CG48<tab># ubiquitin") parses the comment as the
+            # sequence column and dies on the residue check. A '#' inside a
+            # label (MyProt#2) is untouched because it does not start the cell.
+            for i, c in enumerate(cells):
+                if c.startswith("#"):
+                    cells = cells[:i]
+                    break
             if len(cells) < 2:
                 raise SystemExit(
                     f"{path}:{lineno}: need at least 2 columns (chain, id), got {cells!r}"

@@ -1,0 +1,29 @@
+# af3lis smoke test -- 2 baits x 6 preys = 12 folds.
+#
+# Purpose: prove the whole chain works on a new cluster before spending real
+# GPU hours. Every accession below is reviewed (sp|) and its length was
+# verified against UniProt, so the MSAs come back quickly and no entry is a
+# redirect or a merged accession that resolves to an empty sequence.
+#
+# What it does and does NOT cover:
+#   covered      -- UniProt fetch + seq_cache, TSV parsing, grid build, align
+#                   array, bridge grouping across TWO token buckets (256 and
+#                   512), packed GPU inference, collect, figures, PDB export,
+#                   and the afterany chain.
+#   NOT covered  -- the >=4096-token memory tier in the resource ladder. Hitting
+#                   it needs a ~1500 aa partner, which is no longer a "small
+#                   job"; that branch is covered by
+#                   tests/test_pack.py::test_resources_for_ladder instead.
+#
+# Pair sizes run 182-504 tokens, so you should see 2 buckets in
+# af3pack/groups.tsv, both on the 48gb tier (that is correct, not a bug).
+#
+# chain	id	# protein, verified length
+A	P61956	# SUMO2, 95 aa
+A	Q15843	# NEDD8, 81 aa
+B	P63165	# SUMO1, 101 aa
+B	P62987	# UBA52 / ubiquitin-eL40, 128 aa
+B	P61088	# UBE2N (Ubc13), 152 aa
+B	P62837	# UBE2D2, 147 aa
+B	P0CG47	# polyubiquitin-B, 229 aa
+B	P54727	# RAD23B, 409 aa

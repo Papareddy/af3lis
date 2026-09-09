@@ -6,6 +6,8 @@
 #   bash af3lis.sh run    --chains-tsv chains.tsv --name MyScreen [opts]
 #   bash af3lis.sh status MyScreen
 #   bash af3lis.sh report MyScreen                re-score/re-plot a finished run
+#   bash af3lis.sh smoke                          12-fold end-to-end verification
+#   bash af3lis.sh check  smoke                   assert a finished run is complete
 #
 # `run` builds the inputs and submits the whole DAG in one go:
 #     align array -> pack bridge -> packed GPU groups -> analyse
@@ -103,8 +105,111 @@ case "$CMD" in
     "$PY" -m af3lis.cif2pdb "$OUT"
     say "metrics: $D/metrics.tsv"; say "figures: $D/figures" ;;
 
+  smoke)
+    # End-to-end verification on a new cluster. 12 small folds spanning two
+    # token buckets; ~hours for the MSAs, minutes of GPU. Use this BEFORE
+    # committing real GPU hours to a screen.
+    [ -r "$CFG" ] || die "no config at $CFG -- cp config.example.yaml config.yaml and fill it in"
+    NAME="${1:-smoke}"; shift || true
+    D="$(runs_root)/$NAME"
+    say "smoke run '$NAME' -> $D"
+    say "12 folds (2 baits x 6 preys) from examples/smoke.tsv"
+    "$PY" "$REPO/pipeline.py" --config "$CFG" --name "$NAME" --outdir "$D" \
+        --chains-tsv "$REPO/examples/smoke.tsv" "$@"
+    "$PY" "$REPO/pipeline.py" --submit --outdir "$D" --config "$CFG"
+    cat <<EOF
+
+[af3lis] submitted. When it finishes, verify with:
+
+    bash af3lis.sh check $NAME
+
+To also prove the afterany/MISSING path works (recommended), delete one MSA
+after the align array finishes and before the bridge job starts:
+
+    rm -rf $D/out/<one-pair>/
+
+The bridge should exclude it, print a MISSING: line, and the analyse job
+should still score the other 11.
+EOF
+    ;;
+
+  check)
+    # Self-check a finished run. Exits non-zero on the first hard failure, so
+    # it is usable in CI or a wrapper script.
+    NAME="${1:-smoke}"
+    D="$(runs_root)/$NAME"
+    [ -d "$D" ] || die "no run dir at $D"
+    OUT="$D/out_pack"; [ -d "$OUT" ] || OUT="$D/out"
+    fail=0
+    chk() { # chk <label> <actual> <expected-min>
+      if [ "$2" -ge "$3" ] 2>/dev/null; then
+        printf "  \033[32mPASS\033[0m %-34s %s (>= %s)\n" "$1" "$2" "$3"
+      else
+        printf "  \033[31mFAIL\033[0m %-34s %s (want >= %s)\n" "$1" "$2" "$3"; fail=1
+      fi
+    }
+    echo "== af3lis check: $NAME =="
+    NPAIR=$(find "$D/jsons" -name '*.json' 2>/dev/null | wc -l)
+    chk "input JSONs built"        "$NPAIR" 1
+    chk "MSAs on disk"             "$(find "$D/out" -maxdepth 2 -name '*_data.json' 2>/dev/null | wc -l)" 1
+    chk "models (.cif)"            "$(find "$OUT" -maxdepth 3 -name '*model*.cif' 2>/dev/null | wc -l)" 1
+    chk "confidences.json"         "$(find "$OUT" -maxdepth 3 -name '*confidences.json' 2>/dev/null | wc -l)" 1
+    chk "PDB exports"              "$(find "$OUT" -maxdepth 3 -name '*.pdb' 2>/dev/null | wc -l)" 1
+    chk "metrics.tsv rows"         "$( [ -s "$D/metrics.tsv" ] && echo $(($(wc -l < "$D/metrics.tsv")-1)) || echo 0 )" 1
+    chk "figures"                  "$(find "$D/figures" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l)" 3
+    chk "PAE panels"               "$(find "$D/figures/pae" -name '*.png' 2>/dev/null | wc -l)" 1
+    # Packed grouping. NOTE: the smoke fixture is deliberately small, so both
+    # of its buckets sit on the same 48gb tier -- ONE distinct --mem is the
+    # correct result here. The >=4096-token escalation is covered by
+    # tests/test_pack.py::test_resources_for_ladder, not by this run.
+    if [ -s "$D/af3pack/groups.tsv" ]; then
+      NMEM=$(awk -F'\t' 'NR>1{print $7}' "$D/af3pack/groups.tsv" | sort -u | wc -l)
+      NBUCK=$(awk -F'\t' 'NR>1{print $2}' "$D/af3pack/groups.tsv" | sort -u | wc -l)
+      NGRP=$(awk 'NR>1' "$D/af3pack/groups.tsv" | wc -l)
+      printf "  \033[36mINFO\033[0m %-34s %s group(s), %s bucket(s), %s distinct --mem\n" \
+             "resource ladder" "$NGRP" "$NBUCK" "$NMEM"
+      chk "packed groups built" "$NGRP" 1
+    else
+      printf "  \033[33mWARN\033[0m %-34s (legacy array route?)\n" "no af3pack/groups.tsv"
+    fi
+    # a metrics row must carry real numbers, not an empty iLIS column
+    if [ -s "$D/metrics.tsv" ]; then
+      "$PY" - "$D/metrics.tsv" <<'PYCHK'
+import sys, csv
+rows = list(csv.DictReader(open(sys.argv[1]), delimiter="\t"))
+cols = rows[0].keys() if rows else []
+def col(m):
+    for c in (f"{m}_mean_mean", f"{m}_mean", m):
+        if c in cols: return c
+for m in ("iLIS", "PEAK", "ipTM"):
+    c = col(m)
+    if not c:
+        print(f"  \033[31mFAIL\033[0m {m+' column':<34} absent"); sys.exit(1)
+    vals = [r[c] for r in rows if r[c] not in ("", "nan", "NA")]
+    if not vals:
+        print(f"  \033[31mFAIL\033[0m {c:<34} all empty "
+              "(scipy missing? see 'Reading the metrics' in the README)")
+        sys.exit(1)
+    print(f"  \033[32mPASS\033[0m {c:<34} {len(vals)}/{len(rows)} rows populated")
+PYCHK
+      [ $? -ne 0 ] && fail=1 || true
+    fi
+    echo
+    # `|| true` matters: under `set -e -o pipefail` a grep with no matches
+    # aborts the script -- which is precisely the case on a CLEAN run, so
+    # without this `check` fails every successful run before reporting.
+    grep -hE "MISSING:" "$D"/logs/*.out 2>/dev/null | sed 's/^/  excluded: /' | head -5 || true
+    grep -hE "EXIT=[^0]|ERROR" "$D"/logs/*.out 2>/dev/null | sed 's/^/  log: /' | head -5 || true
+    echo
+    if [ "$fail" -eq 0 ]; then
+      printf "\033[32m[af3lis] all checks passed\033[0m -- the pipeline works end to end on this cluster\n"
+    else
+      printf "\033[31m[af3lis] checks FAILED\033[0m -- see above; 'af3lis.sh status %s' has more detail\n" "$NAME"
+    fi
+    exit "$fail" ;;
+
   help|-h|--help)
     sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
   *)
-    die "unknown command '$CMD' (try: setup, template, run, status, report)" ;;
+    die "unknown command '$CMD' (try: setup, template, run, smoke, check, status, report)" ;;
 esac

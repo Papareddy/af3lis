@@ -17,4 +17,6 @@ dependencies:
   - scipy>=1.9
   - pandas>=1.5
   - matplotlib-base>=3.6
-  - pyyaml
+  - pyyaml            # config.yaml parsing (pipeline.py falls back to a tiny
+                      # built-in parser, but af3lis.sh needs the real thing)
+  - pytest            # tests/test_metrics.py only; harmless and small
