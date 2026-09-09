@@ -48,6 +48,39 @@ BUCKETS = [256, 512, 768, 1024, 1280, 1536, 2048, 3072, 4096, 5120]
 # ~bucket^2.2 extrapolations. Recalibrate for other GPUs / size classes.
 DEFAULT_CALIB = {256: 15, 512: 35, 768: 85, 1024: 160, 1280: 260, 1536: 380,
                  2048: 700, 3072: 1600, 4096: 3000, 5120: 4800}
+# ---------------------------------------------------------------------------
+# Size-aware SLURM resources.
+#
+# Every group holds ONE token bucket, so the group's resource need is known
+# before submission and each job can ask for exactly what its size class
+# requires instead of one global setting sized for the worst case.
+#
+# The memory ladder is the load-bearing part on bwHelix and it is NOT a simple
+# "bigger is safer": asking >= 64 GB excludes the 26 abundant 40 GB gpu4 nodes
+# and restricts the job to 4 scarce gpu8 nodes, so a needlessly large --mem
+# costs hours of queue. Small buckets therefore stay at 48 GB deliberately;
+# only >= 4096 tokens escalates, because those genuinely need an 80 GB card.
+#
+# (bucket_max, gres, mem, flash_attn, xla_mem_frac, note)
+RESOURCE_LADDER = [
+    (1536, "gpu:A100:1", "48gb", "triton", 3.2,
+     "fits A100-40GB; 48gb keeps the abundant gpu4 nodes eligible"),
+    (3072, "gpu:A100:1", "60gb", "triton", 3.2,
+     "still under the 64gb gpu4 cutoff; more host RAM for unified-memory spill"),
+    (10 ** 9, "gpu:A100:1", "96gb", "xla", 4.0,
+     ">=4096 tokens: needs an 80GB card (gpu8) and the XLA attention kernel"),
+]
+
+
+def resources_for(bucket: int) -> dict:
+    """SLURM resources + XLA knobs for a single-bucket group."""
+    for hi, gres, mem, flash, frac, note in RESOURCE_LADDER:
+        if bucket <= hi:
+            return dict(bucket=bucket, gres=gres, mem=mem, flash_attn=flash,
+                        xla_mem_frac=frac, note=note)
+    raise AssertionError("unreachable: ladder has a catch-all")
+
+
 DEFAULT_STARTUP = 90.0    # weights load + first-ever compile (s)
 DEFAULT_COMPILE = 40.0    # per-bucket compile (s); 1 bucket/group -> paid once
 
@@ -198,8 +231,16 @@ def write_submit(groups: list[dict],
              f"# packed AF3 inference -- {len(groups)} jobs; keep <= ~100 pending",
              f"# (bwHelix MaxJobsAccruePU=100; trickle-submit if you queue more elsewhere)"]
     for g in groups:
+        r = resources_for(g["bucket"])
+        # sbatch CLI flags override the #SBATCH directives rendered from
+        # config.yaml; the two XLA knobs are not sbatch options so they travel
+        # as env vars the template reads with a config-rendered fallback.
         lines.append(
+            f"# bucket {r['bucket']}: {r['note']}\n"
             f"sbatch --time={g['walltime']} "
+            f"--gres={r['gres']} --mem={r['mem']} "
+            f"--export=ALL,AF3LIS_FLASH_ATTN={r['flash_attn']},"
+            f"AF3LIS_XLA_MEM_FRAC={r['xla_mem_frac']} "
             f"--job-name=af3pack_{os.path.basename(g['dir'])} "
             f"{sbatch_path} {g['dir']} {out_pack}"
         )
@@ -210,11 +251,14 @@ def write_submit(groups: list[dict],
 
     tsv = os.path.join(pack_root, "groups.tsv")
     with open(tsv, "w") as fh:
-        fh.write("group\tbucket\tn_conditions\test_min\twalltime\tmembers\n")
+        fh.write("group\tbucket\tn_conditions\test_min\twalltime\tgres\tmem\t"
+                 "flash_attn\txla_mem_frac\tmembers\n")
         for g in groups:
+            r = resources_for(g["bucket"])
             fh.write(f"{os.path.basename(g['dir'])}\t{g['bucket']}\t"
                      f"{len(g['members'])}\t{g['est_s'] / 60:.1f}\t{g['walltime']}\t"
-                     f"{','.join(g['members'])}\n")
+                     f"{r['gres']}\t{r['mem']}\t{r['flash_attn']}\t"
+                     f"{r['xla_mem_frac']}\t{','.join(g['members'])}\n")
 
     if len(groups) > max_jobs:
         sys.stderr.write(

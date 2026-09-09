@@ -1,0 +1,45 @@
+#!/bin/bash
+#SBATCH -J {JOBNAME}_bridge
+#SBATCH -p {ALIGN_PARTITION}
+#SBATCH --time=00:30:00
+#SBATCH --mem=8gb
+#SBATCH --cpus-per-task=2
+#SBATCH -o {OUTDIR}/logs/pack_bridge_%j.out
+# af3lis -- BRIDGE job between the align array and packed GPU inference.
+# This is the DEFAULT inference route (packing strategy after Mau's bwHelix
+# AF3 toolkit): it runs once the align array has finished, groups whatever
+# MSAs actually landed on disk into few fat single-bucket GPU jobs, and
+# submits them.
+#
+# Chained with `afterany`, NOT `afterok`, deliberately: one failed align task
+# under afterok leaves this job in DependencyNeverSatisfied forever. With
+# afterany it always runs, and af3lis.pack excludes + reports the conditions
+# whose *_data.json is missing -- a partial align gives partial results plus
+# an explicit list of what is missing, instead of a silent hang.
+#
+# Submitted automatically by `pipeline.py --submit`. To use the legacy
+# per-task infer array instead, pass `--array-infer`.
+set -euo pipefail
+mkdir -p "{OUTDIR}/logs"
+
+# Locate the af3lis install. The rendered path is whatever machine ran the
+# build; if you rsynced the build to a cluster, that path is wrong -- so
+# AF3LIS_DIR wins when set, and we verify the result rather than trusting it.
+PIPE="${{AF3LIS_DIR:-{PIPELINE_DIR}}}"
+if [ ! -r "$PIPE/pipeline.py" ]; then
+    echo "ERROR: no pipeline.py under PIPE='$PIPE'." >&2
+    echo "       Set AF3LIS_DIR to the af3lis_pipeline dir on THIS machine and resubmit." >&2
+    exit 3
+fi
+
+PY="${{AF3LIS_PYTHON:-python3}}"
+echo "NODE=$(hostname) PIPE=$PIPE PY=$PY OUTDIR={OUTDIR}"
+
+cd "$PIPE"
+"$PY" pipeline.py --pack --outdir "{OUTDIR}" --target-hours {TARGET_HOURS}
+
+SUBMIT="{OUTDIR}/af3pack/submit_all.sh"
+[ -r "$SUBMIT" ] || {{ echo "ERROR: pack produced no $SUBMIT" >&2; exit 4; }}
+echo "== submitting packed groups =="
+bash "$SUBMIT"
+echo "PACK_BRIDGE_EXIT=0"

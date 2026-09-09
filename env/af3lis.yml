@@ -1,0 +1,20 @@
+# af3lis analysis environment.
+#
+# This env is for the PYTHON side only -- building JSONs, packing, scoring and
+# plotting. AlphaFold 3 itself is NOT installed here: it comes from the
+# cluster module (bio/alphafold/3.0.1 on bwHelix) with the gated DeepMind
+# weights in $HOME/af3-models.
+#
+# Why this file exists at all: the login/compute nodes ship a python without
+# pandas, so `import af3lis` fails there and the pipeline cannot score its own
+# output. bootstrap.sh builds this env once into ./env/.conda.
+name: af3lis
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=1.23
+  - scipy>=1.9
+  - pandas>=1.5
+  - matplotlib-base>=3.6
+  - pyyaml

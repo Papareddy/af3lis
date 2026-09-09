@@ -1,5 +1,8 @@
 # --- local cluster config (NEVER commit; copy from config.example.yaml) ---
+# config.yaml holds account paths; config.<PROJECT>.yaml are per-screen copies.
 config.yaml
+config.*.yaml
+!config.example.yaml
 
 # --- runs, caches, outputs ---
 runs/
@@ -34,9 +37,12 @@ dist/
 htmlcov/
 
 # --- virtualenvs ---
+# NB env/ is a TRACKED source directory (env/af3lis.yml is the conda spec).
+# Only the bootstrap-generated bits are ignored.
 .venv/
 venv/
-env/
+env/.conda/
+env/activate.sh
 
 # --- editors / OS ---
 .DS_Store

@@ -121,6 +121,50 @@ def test_parse_ipsae_txt_max_rows_only():
         os.unlink(path)
 
 
+def test_resources_for_ladder():
+    """Size-aware SLURM resources: the 64gb gpu4 cutoff is the load-bearing rule."""
+    from af3lis.pack import resources_for
+    # small + mid buckets must stay UNDER 64gb, or they lose the 26 abundant
+    # 40GB gpu4 nodes and queue behind 4 scarce gpu8 nodes instead.
+    for b in (256, 512, 768, 1024, 1280, 1536, 2048, 3072):
+        r = resources_for(b)
+        mem_gb = int(r["mem"].replace("gb", ""))
+        assert mem_gb < 64, (b, r["mem"])
+        assert r["flash_attn"] == "triton"
+    # big buckets escalate deliberately
+    for b in (4096, 5120, 8192):
+        r = resources_for(b)
+        assert int(r["mem"].replace("gb", "")) >= 64
+        assert r["flash_attn"] == "xla"
+        assert r["xla_mem_frac"] >= 3.2
+    # monotonic, and every bucket resolves
+    prev = 0
+    for b in (256, 1536, 3072, 4096):
+        m = int(resources_for(b)["mem"].replace("gb", ""))
+        assert m >= prev
+        prev = m
+
+
+def test_submit_all_carries_per_group_resources():
+    """submit_all.sh must override gres/mem per group and export the XLA knobs."""
+    import os, tempfile
+    from af3lis.pack import write_submit
+    d = tempfile.mkdtemp()
+    groups = [dict(dir=os.path.join(d, "group_000_b512"), bucket=512,
+                   members=["a___b"], est_s=600.0, walltime="00:30:00"),
+              dict(dir=os.path.join(d, "group_001_b4096"), bucket=4096,
+                   members=["c___d"], est_s=6000.0, walltime="03:00:00")]
+    sub = write_submit(groups, d, os.path.join(d, "pack_infer.sbatch"),
+                       os.path.join(d, "out_pack"), 90)
+    txt = open(sub).read()
+    assert "--mem=48gb" in txt and "--mem=96gb" in txt, txt
+    assert "AF3LIS_FLASH_ATTN=triton" in txt and "AF3LIS_FLASH_ATTN=xla" in txt
+    assert "AF3LIS_XLA_MEM_FRAC=" in txt
+    tsv = open(os.path.join(d, "groups.tsv")).read().splitlines()
+    assert tsv[0].split("\t")[5:9] == ["gres", "mem", "flash_attn", "xla_mem_frac"]
+    assert len(tsv[1].split("\t")) == len(tsv[0].split("\t")), "groups.tsv column mismatch"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

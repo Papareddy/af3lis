@@ -46,12 +46,16 @@ export CUDA_VISIBLE_DEVICES=${{CUDA_VISIBLE_DEVICES:-0}}
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export TF_FORCE_UNIFIED_MEMORY=true
 unset XLA_PYTHON_CLIENT_MEM_FRACTION
-export XLA_CLIENT_MEM_FRACTION={XLA_MEM_FRAC}
+# XLA unified-memory factor. af3lis.pack overrides this per token bucket via
+# AF3LIS_XLA_MEM_FRAC (big buckets need a larger host-spill pool); the value
+# rendered from config.yaml is the fallback for a hand-submitted job.
+export XLA_CLIENT_MEM_FRACTION=${{AF3LIS_XLA_MEM_FRAC:-{XLA_MEM_FRAC}}}
 
 # -L: group members are symlinks into out/<lname>/
 n=$(find -L "$GROUP_DIR" -maxdepth 1 -name '*_data.json' | wc -l)
 [ "$n" -gt 0 ] || {{ echo "ERROR: no *_data.json in $GROUP_DIR" >&2; exit 6; }}
 echo "PACK_START n=$n group=$GROUP_DIR out=$OUT_ROOT node=$(hostname) date=$(date '+%F %T')"
+echo "PACK_RESOURCES gres=${{SLURM_JOB_GRES:-?}} mem=${{SLURM_MEM_PER_NODE:-?}}MB flash=${{AF3LIS_FLASH_ATTN:-{FLASH_ATTN}}} xla_frac=$XLA_CLIENT_MEM_FRACTION"
 
 python "$ALPHAFOLD_BIN_DIR/run_alphafold.py" \
     --input_dir="$GROUP_DIR" \
@@ -61,7 +65,7 @@ python "$ALPHAFOLD_BIN_DIR/run_alphafold.py" \
     --norun_data_pipeline \
     --num_diffusion_samples={NUM_SAMPLES} \
     --num_recycles={NUM_RECYCLES} \
-    --flash_attention_implementation={FLASH_ATTN} \
+    --flash_attention_implementation=${{AF3LIS_FLASH_ATTN:-{FLASH_ATTN}}} \
     {AF3_INFER_EXTRA}
 rc=$?
 

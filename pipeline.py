@@ -2,8 +2,10 @@
 """af3lis main pipeline -- AlphaFold-3 mirror of boltzlis.
 
 Give chain A and chain B (each one or many protein IDs), get AF3 input JSONs +
-TWO ready-to-submit SLURM arrays (CPU align stage -> GPU infer stage with
-afterok dependency) + the post-run metric-collect command.
+A ready-to-submit SLURM pipeline: CPU align array -> PACKED GPU inference
+via an afterany bridge job (the DEFAULT since packing was adopted from Mau's
+bwHelix AF3 toolkit) + the post-run metric-collect command. `--array-infer`
+restores the legacy per-prediction infer array chained on afterok.
 
 The output TSV schema is byte-identical to boltzlis in `--agg flat` mode
 (iLIS/LIS/cLIS/iLIA/LIA/cLIA/actifpTM/ipSAE/PEAK/ipTM/pTM/pLDDT_i/pLDDT_j +
@@ -60,6 +62,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TMPL_ALIGN = os.path.join(HERE, "slurm", "af3_align.sbatch.tmpl")
 TMPL_INFER = os.path.join(HERE, "slurm", "af3_infer.sbatch.tmpl")
 TMPL_PACK = os.path.join(HERE, "slurm", "af3_pack_infer.sbatch.tmpl")
+TMPL_BRIDGE = os.path.join(HERE, "slurm", "af3_pack_bridge.sbatch.tmpl")
+TMPL_ANALYSE = os.path.join(HERE, "slurm", "af3_analyse.sbatch.tmpl")
 
 # Sentinel for argparse defaults — distinguishes "user didn't pass --seeds"
 # from "user passed --seeds 1". Lets us source seeds from config.yaml when
@@ -221,7 +225,9 @@ def render_sbatches(jobs: list[tuple[str, str]],
     align_sb = os.path.join(outdir, "align.sbatch")
     infer_sb = os.path.join(outdir, "infer.sbatch")
     pack_sb = os.path.join(outdir, "pack_infer.sbatch")
-    for tmpl in (TMPL_ALIGN, TMPL_INFER, TMPL_PACK):
+    bridge_sb = os.path.join(outdir, "pack_bridge.sbatch")
+    analyse_sb = os.path.join(outdir, "analyse.sbatch")
+    for tmpl in (TMPL_ALIGN, TMPL_INFER, TMPL_PACK, TMPL_BRIDGE, TMPL_ANALYSE):
         if not os.path.exists(tmpl):
             raise FileNotFoundError(f"sbatch template missing: {tmpl}")
     rendered_align = _render_template(TMPL_ALIGN, align_map)
@@ -229,13 +235,34 @@ def render_sbatches(jobs: list[tuple[str, str]],
     # Packed template takes GROUP_DIR/OUT_ROOT as $1/$2 at submit time (from
     # af3pack/submit_all.sh) — it shares the infer map (env, module, flags).
     rendered_pack = _render_template(TMPL_PACK, infer_map)
+    # Bridge runs on the CPU partition (it only groups + sbatches), so it
+    # takes the align map plus the pack sizing knob.
+    bridge_map = dict(align_map,
+                      PIPELINE_DIR=os.path.abspath(HERE),
+                      TARGET_HOURS=cfg.get("target_hours", 1.5))
+    rendered_bridge = _render_template(TMPL_BRIDGE, bridge_map)
+    # Final scoring/plot/PDB stage. CPU partition; needs the af3lis conda env,
+    # so it resolves AF3LIS_PYTHON via env/activate.sh at run time.
+    analyse_map = dict(align_map,
+                       PIPELINE_DIR=os.path.abspath(HERE),
+                       ANALYSE_TIME=cfg.get("analyse_time", "02:00:00"),
+                       ANALYSE_MEM=cfg.get("analyse_mem", "32gb"),
+                       ANALYSE_CPUS=cfg.get("analyse_cpus", 8),
+                       AGG_MODE=cfg.get("agg", "per_seed"),
+                       OUT_SUBDIR=cfg.get("out_subdir", "out_pack"),
+                       PEAK_BAR=cfg.get("peak_bar", 0.70),
+                       ILIS_BAR=cfg.get("ilis_bar", 0.23),
+                       COLLECT_EXTRA=cfg.get("collect_extra", ""),
+                       PDB_EXTRA=cfg.get("pdb_extra", ""))
+    rendered_analyse = _render_template(TMPL_ANALYSE, analyse_map)
     # Renderer sanity check: no unsubstituted `{PLACEHOLDER}` should remain.
     # Catches typos in template keys before they hit SLURM. Bash variables
     # like ${VAR} are NOT placeholders — we only flag standalone `{NAME}`
     # NOT preceded by `$`.
     import re as _re
     for tag, text in (("align", rendered_align), ("infer", rendered_infer),
-                      ("pack", rendered_pack)):
+                      ("pack", rendered_pack), ("bridge", rendered_bridge),
+                      ("analyse", rendered_analyse)):
         leftover = _re.findall(r"(?<![\$])\{[A-Z_]+\}", text)
         if leftover:
             raise ValueError(
@@ -247,6 +274,10 @@ def render_sbatches(jobs: list[tuple[str, str]],
         fh.write(rendered_infer)
     with open(pack_sb, "w") as fh:
         fh.write(rendered_pack)
+    with open(bridge_sb, "w") as fh:
+        fh.write(rendered_bridge)
+    with open(analyse_sb, "w") as fh:
+        fh.write(rendered_analyse)
     return align_sb, infer_sb, listfile
 
 
@@ -266,7 +297,7 @@ def write_runbook(outdir: str,
         "# %s -- AF3 run\n\n"
         "**%d fold(s)**, mode=`%s`, seeds=`%s`, diffusion_samples=`%d`, "
         "total samples/pair = `%d`.\n\n"
-        "## Two-stage SLURM (CPU MSA -> GPU inference)\n"
+        "## Two-stage SLURM (CPU MSA -> PACKED GPU inference)\n"
         "```bash\n"
         "# 1. sync this run dir to the cluster workspace.\n"
         "\n"
@@ -274,13 +305,18 @@ def write_runbook(outdir: str,
         "ALIGN_ID=$(sbatch --parsable --array=1-%d %s)\n"
         "echo \"align job=$ALIGN_ID\"\n"
         "\n"
-        "# 3. stage 2: GPU inference, gated on align success.\n"
-        "INFER_ID=$(sbatch --parsable --dependency=afterok:$ALIGN_ID "
-        "--array=1-%d %s)\n"
-        "echo \"infer job=$INFER_ID\"\n"
+        "# 3. stage 2: packed GPU inference via the bridge job.\n"
+        "#    afterany, not afterok: one failed align task under afterok\n"
+        "#    strands the dependent job in DependencyNeverSatisfied.\n"
+        "#    The bridge packs whatever MSAs landed and reports the rest.\n"
+        "#    Legacy per-task array instead: add --array-infer to --submit,\n"
+        "#    or sbatch --dependency=afterok:$ALIGN_ID --array=1-%d %s\n"
+        "INFER_ID=$(sbatch --parsable --dependency=afterany:$ALIGN_ID "
+        "%s/pack_bridge.sbatch)\n"
+        "echo \"pack-bridge job=$INFER_ID\"\n"
         "\n"
-        "# 4. when the infer array finishes, collect ALL metrics:\n"
-        "python %s/pipeline.py --collect %s/out -o %s/metrics.tsv %s\n"
+        "# 4. when the packed groups finish, collect ALL metrics:\n"
+        "python %s/pipeline.py --collect %s/out_pack -o %s/metrics.tsv %s\n"
         "```\n\n"
         "## Or driven via this script (does the chaining for you)\n"
         "```bash\n"
@@ -288,8 +324,9 @@ def write_runbook(outdir: str,
         "# add --dry-run to see the exact sbatch commands without launching\n"
         "# add --align-only / --infer-only to run a single stage\n"
         "```\n\n"
-        "## PACKED inference (RECOMMENDED for >~30 folds on low fairshare)\n"
-        "Replaces stage 2 only (align stays an array). Packs many predictions\n"
+        "## PACKED inference -- THE DEFAULT (run manually here if you want control)\n"
+        "`--submit` already chains this via pack_bridge.sbatch; the commands\n"
+        "below are the same thing done by hand. Replaces stage 2 only (align stays an array). Packs many predictions\n"
         "into few fat jobs via AF3 `--input_dir`: weights load once, XLA\n"
         "compiles once per token bucket, and the jobs sit inside bwHelix's\n"
         "~100-job age-accrue window instead of forfeiting age as array tasks.\n"
@@ -320,7 +357,7 @@ def write_runbook(outdir: str,
         % (name, len(jobs), mode, ",".join(str(s) for s in seeds),
            num_samples, len(seeds) * num_samples,
            len(jobs), os.path.basename(align_sb),
-           len(jobs), os.path.basename(infer_sb),
+           len(jobs), os.path.basename(infer_sb), abs_out,
            HERE, abs_out, abs_out, cfg_arg,
            HERE, abs_out, cfg_arg,
            # packed-inference section
@@ -391,8 +428,18 @@ def cmd_submit(outdir: str,
                no_dependency: bool = False,
                dry_run: bool = False,
                time_align: str | None = None,
-               time_infer: str | None = None) -> tuple[int | None, int | None]:
-    """Submit the rendered two-stage array. Returns (align_id, infer_id)."""
+               time_infer: str | None = None,
+               array_infer: bool = False,
+               analyse: bool = True) -> tuple[int | None, int | None]:
+    """Submit the rendered two-stage pipeline. Returns (align_id, infer_id).
+
+    Inference defaults to the PACKED route (align array -> bridge job ->
+    few fat single-bucket GPU jobs; strategy after Mau's bwHelix AF3
+    toolkit), because a per-prediction array is the wrong shape on a
+    low-fairshare account: array tasks forfeit accrued age and every task
+    re-pays weights-load + XLA compile. Pass array_infer=True for the
+    legacy one-task-per-prediction array.
+    """
     listfile = os.path.join(outdir, "af3_json_list.txt")
     align_sb = os.path.join(outdir, "align.sbatch")
     infer_sb = os.path.join(outdir, "infer.sbatch")
@@ -463,7 +510,35 @@ def cmd_submit(outdir: str,
         if align_id is not None:
             print("align job=%d" % align_id)
 
-    if not align_only and os.path.exists(infer_sb):
+    bridge_sb = os.path.join(outdir, "pack_bridge.sbatch")
+    if not align_only and not array_infer and os.path.exists(bridge_sb):
+        # PACKED route (default). afterany, not afterok: a single failed align
+        # task under afterok would strand this job in DependencyNeverSatisfied
+        # forever. af3lis.pack excludes and reports conditions whose
+        # *_data.json never landed, so a partial align yields partial results
+        # plus an explicit missing list.
+        b_args = ["sbatch", "--parsable"]
+        if (not no_dependency) and align_id is not None:
+            b_args += ["--dependency=afterany:%d" % align_id]
+        b_args += [bridge_sb]
+        quoted = " ".join(shlex.quote(x) for x in b_args)
+        if (dry_run and not no_dependency and align_id is None
+                and not infer_only):
+            parts = quoted.split(" ", 2)  # sbatch --parsable rest
+            quoted = " ".join(
+                parts[:2] + ["--dependency=afterany:%s" % dry_align_token]
+                + parts[2:])
+        # capture the id so a sourced SUBMIT_CMDS.sh can chain the
+        # analyse job onto it ($INFER_ID would otherwise be unbound)
+        cmds_log.append("INFER_ID=$(%s)" % quoted if dry_run else quoted)
+        if dry_run:
+            print(quoted)
+        else:
+            infer_id = _sbatch(b_args)
+            if infer_id is not None:
+                print("pack-bridge job=%d (submits the packed GPU groups "
+                      "when align finishes)" % infer_id)
+    elif not align_only and os.path.exists(infer_sb):
         i_args = ["sbatch", "--parsable", "--array=1-%d" % n]
         if (not no_dependency) and align_id is not None:
             i_args += ["--dependency=afterok:%d" % align_id]
@@ -479,13 +554,36 @@ def cmd_submit(outdir: str,
             parts = quoted.split(" ", 3)  # sbatch --parsable --array=N rest
             dep = "--dependency=afterok:%s" % dry_align_token
             quoted = " ".join(parts[:3] + [dep] + parts[3:])
-        cmds_log.append(quoted)
+        # capture the id so the analyse line below can chain onto it
+        cmds_log.append("INFER_ID=$(%s)" % quoted if dry_run else quoted)
         if dry_run:
             print(quoted)
         else:
             infer_id = _sbatch(i_args)
             if infer_id is not None:
                 print("infer job=%d" % infer_id)
+
+    # ---- final stage: score + plot + PDB, afterany on inference ----
+    analyse_sb = os.path.join(outdir, "analyse.sbatch")
+    if analyse and not align_only and os.path.exists(analyse_sb):
+        # afterany again: score whatever finished rather than hanging when one
+        # GPU group fails. The job itself refuses to run if no models exist.
+        n_args = ["sbatch", "--parsable"]
+        if (not no_dependency) and infer_id is not None:
+            n_args += ["--dependency=afterany:%d" % infer_id]
+        n_args += [analyse_sb]
+        quoted = " ".join(shlex.quote(x) for x in n_args)
+        if dry_run and not no_dependency and infer_id is None:
+            parts = quoted.split(" ", 2)
+            quoted = " ".join(parts[:2] + ["--dependency=afterany:$INFER_ID"] + parts[2:])
+        cmds_log.append(quoted)
+        if dry_run:
+            print(quoted)
+        else:
+            aid = _sbatch(n_args)
+            if aid is not None:
+                print("analyse job=%d (metrics + figures + PDB when inference "
+                      "finishes)" % aid)
 
     if dry_run:
         sh = os.path.join(outdir, "SUBMIT_CMDS.sh")
@@ -527,6 +625,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--num-recycles", type=int, default=10)
     ap.add_argument("--cache", "--seq-cache", dest="cache", default="seq_cache",
                     help="sequence cache dir")
+    ap.add_argument("--chains-tsv", default=None, metavar="TSV",
+                    help="chain-set definition file instead of --chainA/--chainB. "
+                         "Columns: chain(A|B), id, [sequence]. See --chains-tsv-template.")
+    ap.add_argument("--chains-tsv-template", default=None, metavar="PATH",
+                    help="write a starter chains TSV to PATH and exit")
     ap.add_argument("--fasta", action="append", default=[],
                     help="FASTA file(s) overriding ID lookup (repeatable)")
     ap.add_argument("--organism-id", type=int, default=3702,
@@ -538,7 +641,14 @@ def _build_argparser() -> argparse.ArgumentParser:
 
     # submit
     ap.add_argument("--submit", action="store_true",
-                    help="submit the two-stage array (align -> infer afterok)")
+                    help="submit the pipeline: align array -> PACKED GPU "
+                         "inference via a bridge job (default). Use "
+                         "--array-infer for the legacy per-task infer array.")
+    ap.add_argument("--no-analyse", action="store_true",
+                    help="with --submit: do NOT chain the final scoring/plot/PDB job")
+    ap.add_argument("--array-infer", action="store_true",
+                    help="with --submit: use the legacy one-task-per-prediction "
+                         "infer array instead of the default packed route")
     ap.add_argument("--align-only", action="store_true")
     ap.add_argument("--infer-only", action="store_true")
     ap.add_argument("--no-dependency", action="store_true")
@@ -602,6 +712,13 @@ def main() -> None:
     cfg = load_config(a.config)
     cfg_path = a.config if (a.config and os.path.exists(a.config)) else None
 
+    # ---- chains-TSV template short-circuit ----
+    if a.chains_tsv_template:
+        from af3lis.chain_input import write_template
+        write_template(a.chains_tsv_template)
+        print("wrote starter chains TSV -> %s" % a.chains_tsv_template)
+        return
+
     # ---- collect short-circuit ----
     if a.collect:
         if a.output:
@@ -657,12 +774,24 @@ def main() -> None:
         cmd_submit(a.outdir, cfg,
                    align_only=a.align_only, infer_only=a.infer_only,
                    no_dependency=a.no_dependency, dry_run=a.dry_run,
-                   time_align=a.time_align, time_infer=a.time_infer)
+                   time_align=a.time_align, time_infer=a.time_infer,
+                   array_infer=a.array_infer, analyse=not a.no_analyse)
         return
 
     # ---- build ----
+    tsv_overrides: dict[str, str] = {}
+    if a.chains_tsv:
+        from af3lis.chain_input import read_chain_tsv
+        if a.chainA or a.chainB:
+            ap.error("--chains-tsv is mutually exclusive with --chainA/--chainB")
+        a.chainA, a.chainB, tsv_overrides = read_chain_tsv(a.chains_tsv)
+        print("[build] %s -> chainA=%s  chainB=%s%s"
+              % (a.chains_tsv, a.chainA, a.chainB,
+                 ("  (+%d inline sequence(s))" % len(tsv_overrides))
+                 if tsv_overrides else ""))
     if not (a.chainA and a.chainB):
-        ap.error("--chainA and --chainB are required (unless --collect or --submit)")
+        ap.error("--chainA and --chainB (or --chains-tsv) are required "
+                 "(unless --collect or --submit)")
     # complex mode: --complex-name is recommended but optional. cname falls
     # back to a.name below; the dead "a.name == 'run'" guard was removed.
     if a.mode == "complex" and not a.complex_name:
@@ -693,9 +822,9 @@ def main() -> None:
             % a.outdir
         )
 
-    overrides: dict[str, str] = {}
+    overrides: dict[str, str] = dict(tsv_overrides)
     for f in a.fasta:
-        overrides.update(fetch.load_fasta(f))
+        overrides.update(fetch.load_fasta(f))   # --fasta wins over inline TSV
 
     os.makedirs(a.outdir, exist_ok=True)
     os.makedirs(os.path.join(a.outdir, "logs"), exist_ok=True)

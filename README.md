@@ -1,27 +1,351 @@
-# af3lis — AlphaFold 3 interface screening with LIS / actifpTM / PEAK
+# af3lis — one-command AlphaFold-3 interface screening on SLURM
 
-AlphaFold-3 mirror of [`boltzlis`](https://github.com/Papareddy/boltzlis). Give **chain A**
-and **chain B** as protein IDs (each one *or many*), get AF3 input JSONs + a two-stage SLURM
-chain (CPU MSA -> GPU inference), and -- after the run -- a single ranked table with
-**every interface metric**:
+Give it two lists of proteins. It folds every pair with AlphaFold 3 on a
+cluster, scores every interface, and hands back structures, PAE matrices, a
+metrics table and figures. One command, one dependency chain, no babysitting.
 
-| metric | what it is |
+```bash
+git clone https://github.com/Papareddy/af3lis.git && cd af3lis
+bash af3lis.sh setup                              # build the analysis env, check the cluster
+cp config.example.yaml config.yaml                # fill in your cluster paths
+bash af3lis.sh template chains.tsv                # starter input file
+bash af3lis.sh run --chains-tsv chains.tsv --name MyScreen
+```
+
+That submits everything and returns. When the last job finishes you have:
+
+```
+runs/MyScreen/
+  metrics.tsv                 every metric, one row per chain pair
+  figures/
+    peak_vs_ilis.png          interface confidence, hit quadrant shaded
+    ranked_hits.png           top pairs by iLIS
+    heatmap_iLIS.png          chain-A x chain-B grid
+    heatmap_PEAK.png
+    pae/<pair>.png            PAE matrix per pair, chain blocks marked
+  out_pack/<pair>/            AF3 output: *_model.cif, *.pdb, confidences.json
+  groups.tsv                  what each GPU job was given and why
+  logs/                       one log per stage
+```
+
+Inputs can be **UniProt accessions**, **TAIR loci**, **FASTA files**, or raw
+sequences pasted into the input file — mixed freely in one run.
+
+---
+
+## Contents
+
+- [How it runs](#how-it-runs)
+- [Resources on Helix, and how the GPU is chosen](#resources-on-helix-and-how-the-gpu-is-chosen)
+- [Input formats](#input-formats)
+- [Commands](#commands)
+- [Options](#options)
+- [Configuration](#configuration)
+- [Reading the metrics](#reading-the-metrics)
+- [Metrics — provenance](#metrics--provenance)
+- [Traps that cost real time](#traps-that-cost-real-time)
+- [Credits & citation](#credits--citation)
+
+---
+
+## How it runs
+
+Four SLURM stages, chained by dependency. You submit once; SLURM does the rest.
+
+```mermaid
+flowchart TD
+    subgraph L["your machine (or the cluster login node)"]
+        T["chains.tsv<br/>chain / id / sequence"]
+        R["af3lis.sh run"]
+        T --> R
+        R --> RES["resolve IDs<br/>UniProt REST · TAIR xref<br/>FASTA · inline sequence<br/><i>cached in seq_cache/</i>"]
+        RES --> J["build AF3 input JSONs<br/>one per chain pair<br/>seeds baked in"]
+    end
+
+    J --> A
+
+    subgraph S["SLURM"]
+        A["<b>1. ALIGN</b>  CPU array<br/>jackhmmer/nhmmer MSA + templates<br/>one task per pair<br/><i>the long stage</i>"]
+        A -->|afterany| B["<b>2. BRIDGE</b>  1 CPU job, 30 min<br/>reads token counts, groups pairs<br/>into single-bucket GPU jobs<br/>sizes walltime + picks resources"]
+        B -->|submits| G["<b>3. INFERENCE</b>  packed GPU jobs<br/>run_alphafold.py --input_dir<br/>weights load once per job<br/>XLA compiles once per bucket"]
+        G -->|afterany| N["<b>4. ANALYSE</b>  CPU job<br/>lis.py + PEAK + ipsae.py<br/>figures · CIF→PDB"]
+    end
+
+    N --> O["metrics.tsv · figures/ · *.pdb"]
+
+    style A fill:#cde2fb,stroke:#2a78d6
+    style B fill:#e9e8e4,stroke:#9b9a95
+    style G fill:#2a78d6,stroke:#104281,color:#fff
+    style N fill:#f7d9c9,stroke:#eb6834
+    style O fill:#d6f0e4,stroke:#1baf7a
+```
+
+**Why a bridge job rather than one big array.** Token counts are only known
+after the MSAs exist, so the grouping decision cannot be made at submit time.
+The bridge runs on a cheap CPU slot once alignment finishes, reads the real
+sizes, and submits GPU jobs shaped to them.
+
+**Why `afterany` everywhere, not `afterok`.** Under `afterok` a single failed
+alignment task strands every downstream job in `DependencyNeverSatisfied`
+forever, and you get nothing. Under `afterany` the chain always advances:
+the bridge packs whatever MSAs landed and prints a `MISSING:` line for each one
+that did not, and the analyse job scores whatever models exist. A partial run
+gives you partial results plus an explicit list of what to re-run.
+
+---
+
+## Resources on Helix, and how the GPU is chosen
+
+Each packed job holds exactly **one token bucket**, so its size class is known
+before submission and the job can ask for what it actually needs. AF3 pads
+every input up to the next bucket on its ladder
+(256, 512, 768, 1024, 1280, 1536, 2048, 3072, 4096, 5120), and
+`af3lis.pack.resources_for()` maps that bucket onto SLURM resources:
+
+| tokens (bucket) | `--gres` | `--mem` | flash attention | `XLA_CLIENT_MEM_FRACTION` | why |
+|---|---|---|---|---|---|
+| ≤ 1536 | `gpu:A100:1` | **48gb** | `triton` | 3.2 | fits a 40 GB card; 48 GB keeps the **26 abundant gpu4 nodes** eligible |
+| 2048–3072 | `gpu:A100:1` | 60gb | `triton` | 3.2 | still under the 64 GB cutoff; more host RAM for unified-memory spill |
+| ≥ 4096 | `gpu:A100:1` | 96gb | `xla` | 4.0 | needs an 80 GB card (gpu8) and the XLA attention kernel |
+
+**The memory ladder is not "bigger is safer".** On bwHelix, asking for
+**≥ 64 GB excludes the 26 abundant 40 GB gpu4 nodes** and restricts the job to
+4 scarce gpu8 nodes. A needlessly large `--mem` therefore costs hours of queue
+time, not just accounting. Small buckets stay at 48 GB on purpose; only
+≥ 4096-token jobs escalate, because those genuinely will not fit otherwise.
+
+Everything above is emitted into `af3pack/submit_all.sh` as explicit `sbatch`
+overrides and recorded in `groups.tsv`, so the choice is auditable after the
+fact:
+
+```bash
+# groups.tsv
+group             bucket  n_conditions  est_min  walltime  gres        mem    flash_attn  xla_mem_frac  members
+group_000_b768    768     6             44.7     01:00:00  gpu:A100:1  48gb   triton      3.2           ...
+group_003_b4096   4096    2             180.0    04:00:00  gpu:A100:1  96gb   xla         4.0           ...
+```
+
+### Why inference is packed, not one job per fold
+
+Measured on bwHelix, and the reason the default changed:
+
+| | per-task array | packed |
+|---|---|---|
+| weights load + XLA compile | once **per prediction** (~3.3 min measured) | once **per job** |
+| scheduler age | array tasks **forfeit** accrued age on activation | fat jobs keep it |
+| jobs in the accrual window | 1 per fold, blows past `MaxJobsAccruePU=100` | a few dozen |
+
+On a 20-condition × 5-seed run this measured **2.78 h of GPU time packed
+against 3.60 h as an array** — 49 minutes saved on compile alone, a 1.29×
+reduction that scales linearly with the number of folds. The queueing effect is
+larger but harder to measure without a matched control.
+
+### Walltime sizing, and why you should calibrate
+
+Walltime per group is
+`(startup + compile + n_conditions × sec_per_condition × n_seeds) × safety`.
+The built-in `sec_per_condition` table was measured only at buckets **512 and
+768**; everything else is a `bucket^2.2` extrapolation and over-asks by roughly
+2.4×, which hurts backfill. For a new size class or a different GPU, measure
+first:
+
+```bash
+bash af3lis.sh run --chains-tsv chains.tsv --name Probe --probe 10   # one short GPU job
+python -m af3lis.calibrate runs/Probe/logs/pack_*.out --out runs/Probe/calib.json
+bash af3lis.sh run --chains-tsv chains.tsv --name Real --calib runs/Probe/calib.json
+```
+
+---
+
+## Input formats
+
+### chains.tsv (recommended)
+
+Tab-separated. A header row is optional. Blank lines and `#` comments ignored.
+
+```tsv
+chain   id          sequence
+A       UFL1
+A       P0DTC2
+B       AT1G01010
+B       MyMutant    MKVLSPADKTNVKAAWGKVGAHAG...
+```
+
+| column | meaning |
 |---|---|
-| **iLIS** = sqrt(LIS*cLIS) | AFM-LIS primary score; project house cutoff **iLIS >= 0.22** (AFM-paper value: 0.223) |
-| LIS / cLIS | local interaction score (all / contact-restricted) |
-| LIA / cLIA | local interaction *area* (interface size) |
-| **actifpTM** | interface-restricted ipTM (flank-robust) |
-| ipSAE | Dunbrack aligned-error interface score |
-| **PEAK** | 1 - min(inter-chain PAE)/30 -- house metric |
-| ipTM / pTM / pLDDT | AlphaFold 3 reports these — pTM is Zhang & Skolnick 2004; ipTM from AlphaFold-Multimer (Evans 2021) |
+| `chain` | `A` or `B` (also accepts `1`/`2`). In grid mode every A is folded against every B. |
+| `id` | UniProt accession, TAIR locus, or a label resolved from `--fasta` / column 3. |
+| `sequence` | **Optional.** Supply it and `id` becomes a label only — no network lookup. This is how you fold truncations, point mutants and tagged constructs. |
 
-Metrics come from vendored [AFM-LIS](https://github.com/flyark/AFM-LIS) `lis.py`
-(`--platform alphafold3`, parallel `-w`) plus a PEAK pass on the AF3 PAE + `token_chain_ids`,
-aggregated per-seed-then-cross over diffusion samples. The output TSV schema is
-**byte-identical to boltzlis** in `--agg flat` mode, so the same beeswarm plotter and
-PEAK-ranking convention work across engines.
+Two-column files are fine. Duplicate rows are dropped (first wins) so a
+repeated bait cannot silently produce duplicate folds.
 
-### Reading the metrics — PEAK vs actifpTM vs iLIS (+ a scipy gotcha)
+### The alternatives
+
+```bash
+# inline lists
+--chainA UFL1,UFC1 --chainB DDRGK1,CDK5RAP3
+
+# sequences from FASTA (labels come from the headers; wins over inline TSV sequences)
+--fasta my_proteins.fasta
+
+# one multi-chain assembly instead of a pairwise grid
+--mode complex --complex-name UFM_E3 --chainA UFM1,UBA5 --chainB UFC1
+```
+
+ID resolution order for each token: `--fasta` override → inline TSV sequence →
+raw sequence → UniProt accession → TAIR locus lookup. Results are cached in
+`seq_cache/`, so a re-build is offline.
+
+---
+
+## Commands
+
+| command | what it does |
+|---|---|
+| `af3lis.sh setup` | build `env/.conda`, write `env/activate.sh`, check for `sbatch`, the AF3 module and the weights. Run once after cloning. |
+| `af3lis.sh template [path]` | write a starter `chains.tsv`. |
+| `af3lis.sh run --chains-tsv F --name N [opts]` | build inputs **and** submit the whole chain. Any extra option is passed through to `pipeline.py`. |
+| `af3lis.sh status N` | queue state plus what is on disk: MSAs, models, metric rows, figures, PDBs, and the last `MISSING:`/`ERROR` log lines. |
+| `af3lis.sh report N` | re-score, re-plot and re-export PDBs for a finished run without touching SLURM. |
+
+Add `--dry-run` to `run` to write `SUBMIT_CMDS.sh` and submit nothing. The file
+is a sourceable shell script, so you can inspect the exact dependency chain
+before committing GPU hours.
+
+---
+
+## Options
+
+### Input
+
+| option | default | meaning |
+|---|---|---|
+| `--chains-tsv F` | — | chain-set file (see above). Mutually exclusive with `--chainA/--chainB`. |
+| `--chains-tsv-template P` | — | write a starter TSV to `P` and exit. |
+| `--chainA IDs` / `--chainB IDs` | — | comma-separated ID lists. |
+| `--fasta F` | — | repeatable. Sequences by header label; overrides inline TSV sequences. |
+| `--organism-id N` | `3702` | taxon for TAIR-locus lookups (3702 = *A. thaliana*). |
+| `--cache DIR` | `seq_cache` | resolved-sequence cache. |
+| `--name N` | `run` | run name; used for job names and the default run directory. |
+| `--outdir D` | `<workspace>/runs/<name>` | where everything for this run lives. |
+| `--mode grid\|complex` | `grid` | `grid` = every A × every B as 2-chain folds. `complex` = one assembly containing all chains. |
+| `--complex-name N` | `--name` | assembly name in `complex` mode. |
+| `--rebuild` | off | overwrite an existing build in `--outdir`. Without it, a populated run dir is refused. |
+
+### Prediction
+
+| option | default | meaning |
+|---|---|---|
+| `--seeds 1,2,3` | `1` | AF3 model seeds. **Baked into the JSON at build time** — changing them needs `--rebuild`. Duplicates are refused. |
+| `--num-samples N` | `5` | diffusion samples per seed. Total models per pair = `len(seeds) × num_samples`. |
+| `--num-recycles N` | `10` | trunk recycles. |
+
+> **Use more than one seed for anything you will act on.** Diffusion samples
+> vary the coordinates given one fixed trunk representation; seeds re-draw the
+> trunk too, which is the larger source of variance. In one 20-pair rerun of a
+> seed-1 screen, 6 of 11 "hits" failed to reproduce across 5 seeds, and the top
+> hit turned out indistinguishable from its negative control paralog. Five
+> seeds costs 5× the GPU time and is usually worth it.
+
+### Submission
+
+| option | default | meaning |
+|---|---|---|
+| `--submit` | — | submit an already-built run (what `af3lis.sh run` calls for you). |
+| `--array-infer` | off | legacy route: one GPU task per prediction, chained `afterok`. Slower and queue-hostile; kept for reproducing old runs. |
+| `--no-analyse` | off | skip the final scoring/plot/PDB job. |
+| `--align-only` / `--infer-only` | off | run a single stage. |
+| `--no-dependency` | off | submit stages unchained (for manual restarts). |
+| `--dry-run` | off | write `SUBMIT_CMDS.sh`; submit nothing. |
+| `--time-align` / `--time-infer` | from config | override a stage's walltime for this submission. |
+
+### Packing
+
+| option | default | meaning |
+|---|---|---|
+| `--pack` | implied by `--submit` | build packed groups from finished MSAs. |
+| `--target-hours H` | `1.5` | aim each GPU job near this walltime. |
+| `--safety F` | `1.3` | walltime margin on the estimate. |
+| `--calib F` | `<outdir>/calib.json` if present | measured per-bucket seconds from `af3lis.calibrate`. |
+| `--probe N` | `0` | build ONE isolated calibration group of `N` conditions, output to `probe_out/`. |
+| `--pack-max-jobs N` | `90` | warn above this many jobs (≈ the 100-job accrual window). |
+| `--pack-copy` | off | copy data JSONs into groups instead of symlinking. Symlinks are the default because MSA-laden JSONs are large. |
+
+### Scoring and output
+
+| option | default | meaning |
+|---|---|---|
+| `--collect DIR` | — | score an AF3 output root directly, skipping build/submit. |
+| `-o FILE` | `<parent>/metrics.tsv` | metrics output path. |
+| `--agg per_seed\|flat` | `per_seed` | `per_seed` aggregates within each seed then across seeds (honest for multi-seed). `flat` is a single mean/max over all models and is byte-identical to boltzlis. |
+| `--rank-by COL` | `iLIS_max` | sort column. |
+| `--no-ipsae` | off | drop the Dunbrack `ipsae.py` metric family. |
+| `--ipsae-pae-cutoff` / `--ipsae-dist-cutoff` | `10` / `10` | ipsae.py cutoffs. |
+| `--workers N` | `8` | parallel scoring workers. |
+| `--python P` / `--lis-py P` | auto | override the scoring interpreter or the vendored `lis.py`. |
+
+### Figures and PDB (standalone)
+
+```bash
+python -m af3lis.plots  runs/MyScreen/metrics.tsv --out-dir runs/MyScreen/out_pack \
+                        --figdir runs/MyScreen/figures --peak-bar 0.70 --ilis-bar 0.23
+python -m af3lis.cif2pdb runs/MyScreen/out_pack            # each pair's top model
+python -m af3lis.cif2pdb runs/MyScreen/out_pack --all-models
+```
+
+`cif2pdb` carries **pLDDT into the B-factor column**, which is what every
+AlphaFold viewer expects. It is dependency-free, so it checks PDB's hard limits
+rather than silently mangling: > 62 chains, residue numbers > 9999 or > 99,999
+atoms raise an error and tell you to keep the CIF.
+
+---
+
+## Configuration
+
+`config.yaml` is gitignored — it holds paths specific to your account. Start
+from `config.example.yaml`. The fields that matter:
+
+```yaml
+# --- cluster wiring
+af3_module: bio/alphafold/3.0.1     # module that provides run_alphafold.py
+model_dir:  ${HOME}/af3-models      # gated DeepMind weights (a DIRECTORY)
+db_dir:     ${ALPHAFOLD_DATABASES}  # AF3 reference DBs (~628 GB, usually site-wide)
+workspace:  /gpfs/.../hd_xxx-af3    # runs land in <workspace>/runs/<name>
+
+# --- align stage (CPU)
+align_partition: cpu-single
+align_time: 12:00:00
+align_mem: 64gb                     # jackhmmer memory tracks HOMOLOG COUNT, not
+align_cpus: 8                       # query length -- 40gb+ or you will get OOMs
+
+# --- inference stage (GPU) -- fallbacks; af3lis.pack overrides per bucket
+infer_partition: gpu-single
+infer_gpu_gres: gpu:A100:1
+infer_mem: 60gb
+xla_mem_frac: 3.2
+flash_attn: triton
+
+# --- analyse stage (CPU)
+analyse_time: 02:00:00
+analyse_mem: 32gb
+analyse_cpus: 8
+agg: per_seed
+peak_bar: 0.70                      # hit thresholds used by the figures
+ilis_bar: 0.23
+```
+
+`env/activate.sh` (written by `setup`) resolves the analysis interpreter.
+`AF3LIS_PYTHON` overrides it, `AF3LIS_DIR` overrides the repo location, and
+`AF3LIS_CONFIG` / `AF3LIS_RUNS_ROOT` override the config path and run root — all
+useful when the clone lives somewhere different on the cluster than where you
+built the inputs.
+
+---
+
+## Reading the metrics
+
+**PEAK vs actifpTM vs iLIS, and a scipy gotcha.**
 - **PEAK and actifpTM are both *confidence* axes and tend to correlate** (PEAK = 1−min-interchain-PAE/30; actifpTM = interface-restricted ipTM). A high value on either means a *locally* confident contact — but a few low-PAE residues can inflate PEAK/actifpTM even when no real interface forms.
 - **iLIS is the orthogonal check** — it scores interface contact *extent/density*, so it is **not** inflated by a tiny confident contact. A **high-PEAK / low-iLIS** fold is the signature of a small or spurious interface. Require **both** (house bar: PEAK ≥ 0.7 *and* iLIS ≥ 0.22); treat single-metric (PEAK-only) hits as provisional, and prefer multi-seed + cross-engine (Boltz↔AF3) agreement.
 - **iLIS needs `scipy`.** `lis.py` imports `scipy.spatial.distance`; if the collect Python lacks scipy, **lis.py fails silently** — `metrics.tsv` comes back with PEAK populated but **iLIS empty/zero**, and `collect` still exits 0. Always collect with a numpy + **scipy** + pandas env and sanity-check that the iLIS column is non-empty.
@@ -36,234 +360,10 @@ PEAK-ranking convention work across engines.
 
 ---
 
-## Step-by-step guide (local + Helix / bwForCluster)
-
-**Who runs what, where** -- the work splits across four contexts:
-
-| step | runs on | needs |
-|---|---|---|
-| 1. build inputs (resolve IDs -> sequences -> JSONs) | **your laptop** (or any internet machine) | internet (UniProt), Python |
-| 2. AF3 MSA (CPU) + inference (GPU) | **Helix CPU + GPU nodes** | `bio/alphafold/3.0.1` + AF3 weights + DBs |
-| 3. collect metrics | **Helix** (or laptop, if outputs copied) | numpy + scipy + pandas |
-| 4. plot / inspect | laptop | matplotlib |
-
-> A coding agent (e.g. Claude Code) can do all four end-to-end: give it this repo +
-> SSH access to Helix and it can install, build, submit, collect, and pull results.
-
-### 0. One-time install -- laptop
-```bash
-git clone https://github.com/Papareddy/af3lis.git af3lis_pipeline
-cd af3lis_pipeline
-python -m venv .venv && source .venv/bin/activate     # or: conda create -n af3lis python=3.11
-pip install -r requirements.txt                        # numpy scipy pandas matplotlib pytest
-pip install -e .                                       # installs the 'af3lis' console script
-pytest -xvs tests/test_metrics.py                      # -> "all tests passed"
-```
-(Test fixtures live under `tests/data/`; if absent on a fresh clone, the suite
-will skip the fixture-dependent tests and report which ones it ran.)
-
-### 1. One-time setup -- Helix
-
-AlphaFold 3 weights are **gated by DeepMind** and not redistributable. You must request
-access yourself (https://github.com/google-deepmind/alphafold3) and place the params under
-`$HOME/af3-models/` on the cluster.
-
-```bash
-ssh helix                                               # your bwForCluster login
-# (a) a workspace to hold runs (60-day, extendable):
-ws_allocate af3lis 60                                   # -> prints a path; call it $WS
-export WS=$(ws_find af3lis)
-
-# (b) clone the repo on Helix too (needed for collect + lis.py):
-git clone https://github.com/Papareddy/af3lis.git $WS/af3lis_pipeline
-
-# (c) AF3 weights (gated, one-time, ~1 GB compressed):
-#     after you've been approved by DeepMind, place the params (`af3.bin.zst`)
-#     under $HOME/af3-models/ and decompress with zstd:
-mkdir -p $HOME/af3-models
-#     zstd -d af3.bin.zst -o $HOME/af3-models/af3.bin
-ls $HOME/af3-models                                     # should list af3.bin (+ checksums)
-#     model_dir in config.yaml points at this directory (not the file itself).
-
-# (d) AF3 reference DBs (~628 GB). DEFAULT = system-wide $ALPHAFOLD_DATABASES from the
-#     bio/alphafold module. If your site already exports it, skip; otherwise:
-#       module avail bio/alphafold                      # -> exact module tag on your site
-#       module load bio/alphafold/3.0.1
-#       echo $ALPHAFOLD_DATABASES                       # -> sanity-check the path
-#     If $ALPHAFOLD_DATABASES is unset on your cluster, you MUST point `db_dir`
-#     in config.yaml at a local mirror — see DeepMind's `fetch_databases.sh`.
-#     Only mirror a private copy if your site does NOT ship the DBs.
-
-# (e) an analysis env for collect/lis (numpy+scipy+pandas):
-conda create -y -n analysis python=3.11 numpy scipy pandas matplotlib pytest
-conda activate analysis
-pip install -e $WS/af3lis_pipeline                      # installs the 'af3lis' console script
-#     (AF3 itself runs from the module's own env; this env is for post-processing only.)
-
-# (f) write your config (gitignored; never commit real paths):
-cd $WS/af3lis_pipeline
-cp config.example.yaml config.yaml
-#     edit config.yaml ->  af3_module: bio/alphafold/3.0.1
-#                          model_dir:  $HOME/af3-models
-#                          db_dir:     ${ALPHAFOLD_DATABASES}
-#                          python:     <analysis python with numpy/scipy/pandas>
-#                          workspace:  $WS
-#                          align/infer: partition/time/mem/cpus/gpu_gres for your site
-```
-
-### 2. Build inputs -- laptop
-```bash
-af3lis build --name UFM_screen \
-    --chainA UFL1,UFC1 \
-    --chainB DDRGK1,CDK5RAP3 \
-    --fasta examples/ufm_machinery.fasta \
-    --outdir runs/UFM_screen \
-    --seeds 1 --num-samples 5 --num-recycles 10
-# writes runs/UFM_screen/{jsons/*.json, af3_json_list.txt,
-#                         align.sbatch, infer.sbatch, RUNBOOK.md}
-```
-- IDs = a **name in your `--fasta`** file (above), a **UniProt accession** (`P61960`),
-  a **TAIR locus** (`AT1G01010`), or **`LABEL=SEQUENCE`**. `LABEL=` is just a display name.
-  Bundling a local FASTA keeps your targets off any web lookup.
-- `--chainA` / `--chainB` are comma-separated lists -> "single or multiple" scales the
-  grid: `1x1`, `Nx1`, or `NxM` pairwise 2-chain folds.
-- One multi-chain assembly instead of a grid: `--mode complex --complex-name MyComplex`.
-- `--seeds` are **baked into the JSON in stage 1** (they key the diffusion noise; the MSA is
-  sequence-keyed, but AF3 still requires re-running align if you change `modelSeeds` because
-  the augmented `<lname>_data.json` archives the seed list). To change seeds, rebuild and
-  re-align; `af3lis submit` precondition-checks this and refuses to silently mismatch.
-- Pair-name separator is **triple underscore** (`___`); labels survive single underscores
-  cleanly (no `FOO_2` vs `FOO__2` collision).
-
-### 3. Sync + submit -- Helix
-```bash
-# $WS expands on the LAPTOP (it has no $WS). Two options:
-#   (a) hard-code the workspace path printed by ws_allocate, or
-#   (b) ssh helix 'echo $WS' first to capture it locally.
-WS_REMOTE=$(ssh helix 'echo $WS')                       # one-shot capture
-rsync -av runs/UFM_screen  helix:$WS_REMOTE/runs/        # copy the built run dir over
-ssh helix
-cd $WS/af3lis_pipeline
-conda activate analysis                                  # 'af3lis' lives in this env
-af3lis submit --outdir $WS/runs/UFM_screen --config config.yaml
-# under the hood:
-#   align_id=$(sbatch --parsable --array=1-N align.sbatch)
-#   sbatch --dependency=afterok:$align_id --array=1-N infer.sbatch
-squeue --me                                              # logs in runs/.../logs/
-```
-AF3 writes models into `$WS/runs/UFM_screen/out/<lname>/...` (the
-`{OUTDIR}/out` directory the sbatch templates create).
-
-Two-stage flow:
-
-| stage | partition | what it does | wallclock |
-|---|---|---|---|
-| **align** | `cpu-single` | jackhmmer/nhmmer MSA + templates; writes `<lname>_data.json` per pair | 12 h default |
-| **infer** | `gpu-single` (A100) | diffusion sampling from MSA; writes models + confidences | 2 h default; bump to 6 h for >2500 residues |
-
-Useful submit flags:
-- `--align-only` / `--infer-only` -- run one stage at a time (debugging MSAs / re-running GPU).
-- `--no-dependency` -- submit infer without an `afterok` gate. Combine with `--infer-only`
-  to skip align entirely; otherwise BOTH stages still run, just unchained.
-- `--dry-run` -- write `SUBMIT_CMDS.sh` without sbatching (dependency placeholders preserved).
-- `--time-align HH:MM:SS` / `--time-infer HH:MM:SS` -- per-submission wallclock overrides.
-
-> **Large complexes (~3100 residues).** Default `XLA_CLIENT_MEM_FRACTION=3.2`
-> + `TF_FORCE_UNIFIED_MEMORY=true` (in the infer template) enables GPU->host spill on
-> A100-40 GB. Switch `flash_attn: xla` and bump to A100-80 GB beyond ~3500 residues.
-> JAX cold-start compiles the model graph (~5-10 min/node) on the first job of every node
-> -- bake into wallclock estimates even for tiny test pairs.
-
-### 3b. PACKED inference -- recommended for >~30 folds on low fairshare
-
-Packing strategy after **Mau's bwHelix AF3 pipeline toolkit** (Aug 2026). The per-task
-array is the wrong shape on a scarce-GPU, low-fairshare account: bwHelix accrues age
-priority on only ~100 jobs (`MaxJobsAccruePU=100`), backfill-tests 128 per cycle, and
-**array tasks forfeit their accrued age** -- while every task re-pays weights-load + XLA
-compile (~5-10 min). Packed inference instead runs MANY `*_data.json` through ONE
-`run_alphafold.py --input_dir` process per job: weights load once, XLA compiles once per
-token bucket. `af3lis.pack` builds **single-bucket groups** sized to hit a target
-walltime (small complexes pack many per job, big ones few), so a job never blows its
-wallclock because sizes were mixed. Measured on bwHelix: a ~100-condition bucket-512
-screen ≈ 1 h in one packed job vs days queued as an array.
-
-```bash
-# after the ALIGN array completes, on the cluster:
-
-# (a) new size class or GPU? probe + calibrate first (one ~20-min GPU job):
-python pipeline.py --pack --probe 10 --outdir $WS/runs/UFM_screen
-bash $WS/runs/UFM_screen/af3pack_probe/submit_all.sh          # -> probe_out/ (isolated)
-python -m af3lis.calibrate $WS/runs/UFM_screen/logs/pack_*.out \
-       --out $WS/runs/UFM_screen/calib.json
-
-# (b) size + submit the campaign (auto-uses <outdir>/calib.json when present):
-python pipeline.py --pack --outdir $WS/runs/UFM_screen [--target-hours 1.5]
-bash $WS/runs/UFM_screen/af3pack/submit_all.sh
-# models -> out_pack/ (separate from out/, which holds the align-stage data JSONs);
-# collect exactly as in step 4 but on out_pack/
-```
-
-Pack mechanics worth knowing:
-- Groups are **symlinks** into `out/<lname>/` (`--pack-copy` to copy); conditions whose
-  align task failed are excluded and listed in `af3pack_missing.txt` (re-align, re-pack).
-- Walltimes come from a per-bucket seconds table; only buckets 512/768 were measured
-  (A100) -- **always probe + `--calib` for a new size class**. Safety margin `--safety 1.3`.
-- AF3 writes each condition's output as it finishes, so a timed-out group loses only its
-  un-run tail; the job log prints `MISSING: <lname>` lines for exactly those (delete those
-  partial dirs before re-running the group, else AF3 diverts to timestamped siblings).
-- Keep total pending jobs <= ~100; never `scancel` a pending job to retime it --
-  `scontrol update JobId=<id> TimeLimit=<minutes>` (decrease only) preserves accrued age.
-
-### 4. Collect every metric -- Helix (one command)
-```bash
-# after the array finishes (conda env 'analysis' carries numpy/scipy/pandas):
-conda activate analysis
-af3lis collect $WS/runs/UFM_screen/out -o $WS/runs/UFM_screen/metrics.tsv -w 8
-# or back-compat shortcut (matches boltzlis muscle memory):
-af3lis --collect $WS/runs/UFM_screen/out -o $WS/runs/UFM_screen/metrics.tsv -w 8
-```
-`metrics.tsv` = one row per pair, ranked by `iLIS_max_max` (or `iLIS_max` in flat mode),
-with **per-seed-then-cross mean+max of every metric** (iLIS / LIS / cLIS / LIA / cLIA /
-ipSAE / actifpTM / ipTM / pTM / PEAK / pLDDT) **plus the Dunbrack `ipsae.py` family**
-(`ipSAE_d0res` / `ipSAE_d0chn` / `ipSAE_d0dom` / `ipTM_d0chn` / `pDockQ` / `pDockQ2` /
-`LIS_ipsae`; skip with `--no-ipsae`). The per-model CSV with residue-level LIR /
-cLIR lives alongside as `metrics.tsv.permodel.csv`.
-
-> Cross-check for free: our `lis.py`-derived `ipSAE` and `ipsae.py`'s `ipSAE_d0res` are
-> independent implementations of the same score -- they agree to ~1e-3 on the same model
-> (verified on ECT5 x NOT1-SH). A large disagreement = investigate the inputs.
-> `--agg flat` is byte-identical to the boltzlis schema **only with `--no-ipsae`**
-> (the ipsae columns are appended after pLDDT otherwise).
-
-Aggregation modes (`--agg`):
-
-| mode | columns per metric | when to use |
-|---|---|---|
-| `per_seed` (default) | 4 (`_mean_mean`, `_mean_max`, `_max_mean`, `_max_max`) | multi-seed AF3 runs -- avoids the upward bias of `max` over correlated diffusion samples within a seed |
-| `flat` | 2 (`_mean`, `_max`) -- **byte-identical to boltzlis** | direct cross-engine comparison vs Boltz-2 (match `--num-samples` between engines for fairness) |
-
-`--rank-by iLIS_max` (boltzlis vocabulary) auto-translates to `iLIS_max_max` in `per_seed` mode.
-
-### 5. Pull + inspect -- laptop
-```bash
-rsync -av helix:$WS/runs/UFM_screen/metrics.tsv         runs/UFM_screen/
-rsync -av helix:$WS/runs/UFM_screen/metrics.tsv.permodel.csv  runs/UFM_screen/
-column -t -s$'\t' runs/UFM_screen/metrics.tsv | less -S
-
-# the house beeswarm (PEAK, one dot per A-side, grouped by B-side, control anchor):
-af3lis plot --tsv runs/UFM_screen/metrics.tsv \
-            -o    runs/UFM_screen/beeswarm_PEAK.pdf \
-            --metric PEAK_max_max \
-            --group-by prey \
-            --control UFL1___DDRGK1 \
-            --threshold-peak 0.7 --threshold-ilis 0.22
-# auto-opens via `open` on macOS; no-op on Linux/cluster.
-```
-Rule of thumb: a confident interaction passes **iLIS >= 0.22 AND PEAK >= 0.7**.
 
 ---
 
-## Metrics -- provenance
+## Metrics — provenance
 
 Every column in `metrics.tsv` comes from one of three places: (1) AF3 JSON read by `lis.py`,
 (2) AF3 PAE + `token_chain_ids` read by `af3lis.collect.peak_table`, (3) `peak_per_chainpair`
@@ -294,40 +394,94 @@ for chain ordering and unit-test cross-checks.
 
 ---
 
-## Layout
-```
-pipeline.py                       thin shim -> af3lis.pipeline:main (boltzlis-style entry)
-af3lis/
-  fetch.py                        ID (UniProt acc | TAIR locus | seq) -> sequence (+cache)
-  json_build.py                   chain-sets -> AF3 input JSON(s)  (grid | complex)
-  structure.py                    CIF parser + token-axis PEAK chain split
-  af3_io.py                       single source of truth for AF3 output paths + FoldResult
-  collect.py                      lis.py + PEAK + ipsae.py -> ranked per-pair metric table
-                                  [af3lis collect ...   or   af3lis --collect ...]
-  lis.py                          vendored AFM-LIS (iLIS/LIS/cLIS/LIA/ipSAE/actifpTM)
-  ipsae.py                        vendored Dunbrack ipsae.py v3 (ipSAE_d0*/pDockQ/pDockQ2)
-  ipsae_runner.py                 drives ipsae.py per sample, parses the max rows
-  pack.py                         packed-inference grouper (strategy after Mau's toolkit)
-  calibrate.py                    per-bucket seconds from a packed job log -> calib.json
-slurm/
-  af3_align.sbatch.tmpl           CPU MSA stage
-  af3_infer.sbatch.tmpl           GPU inference stage (afterok chained; per-task array)
-  af3_pack_infer.sbatch.tmpl      PACKED GPU inference (--input_dir; driven by af3pack/)
-pyproject.toml                    package metadata (entry point: af3lis -> pipeline.main)
-requirements.txt                  pinned numpy/scipy/pandas/matplotlib/pytest
-.gitignore                        excludes config.yaml + seq_cache + runs/
-LICENSE                           MIT
-config.example.yaml               cluster paths/resources (generic placeholders)
-tests/                            local unit tests (no cluster/GPU needed)
-<per-run outputs>
-  runs/<name>/RUNBOOK.md          regenerated on each build — submit + collect commands
-  runs/<name>/af3_json_list.txt   one absolute JSON path per line (SLURM array driver)
-  runs/<name>/{align,infer}.sbatch  rendered SLURM templates
-  runs/<name>/jsons/<pair>.json   AF3 input JSON per pair (or per complex)
-```
 
 ---
 
+## Traps that cost real time
+
+Each of these has bitten a real run. The first three are the expensive ones.
+
+1. **A `COMPLETED` align task does not mean the MSA exists.** If jackhmmer is
+   OOM-killed, AF3 raises but the wrapper still exits 0 — SLURM reports success
+   and no file is written. Always count what is on disk
+   (`af3lis.sh status` does this for you). And note jackhmmer memory tracks the
+   **number of homologs found**, not query length: a 1176 aa protein OOM'd at
+   20 GB while a 2022 aa protein in the same run passed. Ask for ≥ 40 GB.
+
+2. **`--mem ≥ 64gb` on A100 costs you hours of queue.** It excludes the 26
+   abundant 40 GB gpu4 nodes and restricts you to 4 scarce gpu8 nodes. This is
+   why the resource ladder keeps small buckets at 48 GB. Do not "round up".
+
+3. **Never `scancel` a pending job to resubmit it with a better walltime.**
+   That discards accrued age, which is most of what gets you a GPU at low
+   fairshare. Retime in place: `scontrol update JobId=<id> TimeLimit=<minutes>`
+   (you may only decrease it).
+
+4. **List vs dict is the whole AF3 JSON dialect.** `[{...}]` is
+   `alphafoldserver` (no MSAs); `{...}` is `alphafold3` (MSAs embedded). AF3
+   dispatches on the JSON *type*, so wrapping a `_data.json` in a list makes it
+   silently ignore your MSAs. Chain multiplicity is `"id"`, never `"count"`.
+
+5. **`MaxArraySize` is 1001.** `conditions × seeds ≥ 1001` is rejected and the
+   dependent job hangs. Packing sidesteps this entirely.
+
+6. **A mutant or truncation needs its own MSA.** An AF3 MSA must match its
+   query exactly, so it can never be reused across a sequence change. Changing
+   `--seeds` does *not* invalidate the MSA — only the sequence does.
+
+7. **`--seeds` is baked into the JSON at build time.** Changing it requires
+   `--rebuild`. If you only want more seeds on an existing run, rewrite
+   `modelSeeds` in **both** `jsons/*.json` and `out/*/[name]_data.json`:
+   `pack.py` reads the seed count from `jsons/`, so editing only the data JSON
+   sizes every group for one seed and the jobs hit their walltime.
+
+8. **AF3 lowercases output directory names**, and appends a timestamp when the
+   target directory is non-empty. Search case-insensitively and expect
+   `<name>_20260904_121314/` siblings.
+
+9. **`~` and `$VAR` do not expand in a quoted `scp` remote path.** Resolve the
+   path over `ssh` first and use the absolute form.
+
+10. **The cluster python probably has no pandas.** That is the whole reason
+    `bootstrap.sh` exists. If the analyse job dies with a missing-module error,
+    run `bash bootstrap.sh` on the cluster and resubmit just that stage.
+
+---
+
+## Layout
+
+```
+af3lis.sh                       one-command driver (setup / template / run / status / report)
+bootstrap.sh                    creates env/.conda, writes env/activate.sh, checks the cluster
+pipeline.py                     the full CLI: build / submit / pack / collect
+config.example.yaml             copy to config.yaml and fill in
+env/
+  af3lis.yml                    conda spec for the analysis side (no AF3 here)
+  activate.sh                   generated; resolves AF3LIS_PYTHON
+af3lis/
+  chain_input.py                chains.tsv parser
+  fetch.py                      UniProt / TAIR / FASTA / raw-sequence resolution
+  json_build.py                 AF3 input JSON construction
+  pack.py                       size-aware grouping + the SLURM resource ladder
+  calibrate.py                  measured per-bucket seconds from a packed job log
+  af3_io.py                     AF3 output reader (models, PAE, ranking)
+  structure.py                  CIF/PDB parsing, PEAK per chain pair
+  collect.py                    lis.py + PEAK + ipsae.py -> metrics.tsv
+  lis.py                        vendored LIS/iLIS/actifpTM/ipSAE scorer
+  ipsae.py                      vendored Dunbrack ipsae.py v3
+  ipsae_runner.py               driver for the above
+  plots.py                      figures from metrics.tsv (+ PAE panels)
+  cif2pdb.py                    mmCIF -> PDB, pLDDT in the B-factor column
+slurm/
+  af3_align.sbatch.tmpl         stage 1, CPU array
+  af3_pack_bridge.sbatch.tmpl   stage 2, grouping + submission
+  af3_pack_infer.sbatch.tmpl    stage 3, packed GPU inference
+  af3_infer.sbatch.tmpl         stage 3, legacy per-task array
+  af3_analyse.sbatch.tmpl       stage 4, scoring + figures + PDB
+tests/
+  test_pack.py                  bucketing, walltime maths, resource ladder, submit script
+  test_metrics.py               metric parsing (needs pytest)
+```
 ## Notes
 
 - Sequence fetch runs **locally** (compute nodes have no internet); AF3 MSA and inference
@@ -349,6 +503,7 @@ tests/                            local unit tests (no cluster/GPU needed)
   filter for tiny complexes; PEAK/iLIS remain meaningful. `af3lis plot` warns on stderr.
 
 ---
+
 
 ## Credits & citation
 

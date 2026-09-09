@@ -1,0 +1,77 @@
+#!/bin/bash
+#SBATCH -J {JOBNAME}_analyse
+#SBATCH -p {ALIGN_PARTITION}
+#SBATCH --time={ANALYSE_TIME}
+#SBATCH --mem={ANALYSE_MEM}
+#SBATCH --cpus-per-task={ANALYSE_CPUS}
+#SBATCH -o {OUTDIR}/logs/analyse_%j.out
+# af3lis -- FINAL stage: score every model, plot, and export PDB.
+#
+# Chained with `afterany` on the inference stage, deliberately. Under afterok a
+# single failed GPU group would leave this job in DependencyNeverSatisfied and
+# you would get NO metrics at all for the groups that did finish; with afterany
+# it always runs and scores whatever landed, then tells you what is missing.
+#
+# Runs on the CPU partition: scoring is numpy/pandas work, no GPU needed.
+set -uo pipefail
+
+REPO="${{AF3LIS_DIR:-{PIPELINE_DIR}}}"
+if [ ! -r "$REPO/pipeline.py" ]; then
+    echo "ERROR: no pipeline.py under '$REPO'. The path baked in at build time is" >&2
+    echo "       the machine that ran the build; export AF3LIS_DIR on THIS machine." >&2
+    exit 3
+fi
+# shellcheck disable=SC1091
+[ -r "$REPO/env/activate.sh" ] && source "$REPO/env/activate.sh"
+PY="${{AF3LIS_PYTHON:-python3}}"
+echo "NODE=$(hostname) REPO=$REPO PY=$PY ($("$PY" -V 2>&1))"
+
+# The analysis stack needs pandas; the bare cluster python usually has none.
+"$PY" -c 'import pandas, numpy, matplotlib' 2>/dev/null || {{
+    echo "ERROR: '$PY' lacks pandas/numpy/matplotlib. Run: bash $REPO/bootstrap.sh" >&2
+    exit 4
+}}
+
+# Resolve the model root at RUN time: the packed route writes out_pack/, the
+# legacy per-task array writes out/. Baking one in at build time breaks the
+# other, so try the configured one first and fall back to whichever has models.
+OUT=""
+for cand in "{OUTDIR}/{OUT_SUBDIR}" "{OUTDIR}/out_pack" "{OUTDIR}/out"; do
+    if [ -d "$cand" ] && [ -n "$(find "$cand" -maxdepth 3 -name '*model*.cif' -print -quit 2>/dev/null)" ]; then
+        OUT="$cand"; break
+    fi
+done
+if [ -z "$OUT" ]; then
+    echo "ERROR: no models under {OUTDIR}/{OUT_SUBDIR}, out_pack/ or out/ --" >&2
+    echo "       did the inference stage run? Check logs/pack_*.out." >&2
+    exit 5
+fi
+NMODEL=$(find "$OUT" -maxdepth 3 -name '*model*.cif' 2>/dev/null | wc -l)
+echo "ANALYSE_INPUT out=$OUT models=$NMODEL"
+[ "$NMODEL" -gt 0 ] || {{ echo "ERROR: no *_model*.cif under $OUT" >&2; exit 6; }}
+
+cd "$REPO"
+rc=0
+
+echo "== 1/3 metrics =="
+"$PY" pipeline.py --collect "$OUT" -o "{OUTDIR}/metrics.tsv" \
+    --agg {AGG_MODE} --workers {ANALYSE_CPUS} {COLLECT_EXTRA} || rc=$?
+
+echo "== 2/3 figures =="
+if [ -s "{OUTDIR}/metrics.tsv" ]; then
+    "$PY" -m af3lis.plots "{OUTDIR}/metrics.tsv" \
+        --out-dir "$OUT" --figdir "{OUTDIR}/figures" \
+        --peak-bar {PEAK_BAR} --ilis-bar {ILIS_BAR} || rc=$?
+else
+    echo "WARNING: metrics.tsv missing or empty -- skipping figures" >&2
+    rc=${{rc:-7}}
+fi
+
+echo "== 3/3 PDB export =="
+"$PY" -m af3lis.cif2pdb "$OUT" {PDB_EXTRA} || echo "WARNING: PDB export failed" >&2
+
+echo "ANALYSE_SUMMARY metrics=$( [ -s "{OUTDIR}/metrics.tsv" ] && wc -l < "{OUTDIR}/metrics.tsv" || echo 0 ) rows"
+echo "                figures=$(find "{OUTDIR}/figures" -name '*.png' 2>/dev/null | wc -l)"
+echo "                pdb=$(find "$OUT" -name '*.pdb' 2>/dev/null | wc -l)"
+echo "AF3_ANALYSE_EXIT=$rc"
+exit $rc
