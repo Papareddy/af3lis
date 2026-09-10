@@ -71,5 +71,13 @@ infer_extra: ""
 # the MSA in the align stage is keyed by the JSON content).
 seeds: [1]
 
+# SLURM MaxArraySize for this site. --submit refuses to build an array larger
+# than this, because SLURM would reject it and the failure would only surface
+# two stages later. Check yours with:
+#     scontrol show config | grep MaxArraySize
+# The array is sized by CONDITIONS, not conditions x seeds -- seeds are baked
+# into each input JSON, so more seeds lengthen each task rather than adding tasks.
+max_array_size: 1001
+
 # Public-repo safety: config.yaml is gitignored. Never commit real screen
 # target names or cluster usernames here.

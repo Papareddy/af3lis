@@ -450,6 +450,26 @@ def cmd_submit(outdir: str,
         raise SystemExit("%s is empty -- nothing to submit" % listfile)
     n = len(paths)
 
+    # --- array-size guard -------------------------------------------------
+    # SLURM refuses --array=1-N above MaxArraySize (1001 on bwHelix) and the
+    # rejection is easy to miss: the align array never runs, the afterany
+    # bridge fires anyway, finds no MSAs, and the failure surfaces two stages
+    # later as "no models". Fail here instead, with the arithmetic shown.
+    #
+    # NB in af3lis the array is sized by CONDITIONS, not conditions x seeds --
+    # seeds are baked into each input JSON, so more seeds make each task longer
+    # rather than adding tasks.
+    max_array = int(cfg.get("max_array_size", 1001))
+    if n > max_array:
+        raise SystemExit(
+            f"{n} conditions exceeds this site's MaxArraySize ({max_array}), so "
+            f"`sbatch --array=1-{n}` would be REJECTED.\n"
+            f"  Split the screen across run dirs, e.g. two builds of "
+            f"~{n // 2 + 1} pairs each with separate --outdir, or raise\n"
+            f"  max_array_size in config.yaml if your site allows more "
+            f"(check: scontrol show config | grep MaxArraySize)."
+        )
+
     # seeds baked into JSON in stage 1; abort early if user edited cfg without rebuilding
     if "seeds" in cfg:
         _check_seeds_baked(listfile, cfg["seeds"])

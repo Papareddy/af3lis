@@ -540,8 +540,14 @@ Each of these has bitten a real run. The first three are the expensive ones.
    dispatches on the JSON *type*, so wrapping a `_data.json` in a list makes it
    silently ignore your MSAs. Chain multiplicity is `"id"`, never `"count"`.
 
-5. **`MaxArraySize` is 1001.** `conditions × seeds ≥ 1001` is rejected and the
-   dependent job hangs. Packing sidesteps this entirely.
+5. **`MaxArraySize` is 1001.** Above it `sbatch --array=1-N` is rejected, and
+   the rejection is easy to miss — the align array never runs, the `afterany`
+   bridge fires anyway, finds no MSAs, and the problem surfaces two stages
+   later as "no models". `--submit` now refuses up front instead; raise
+   `max_array_size` in `config.yaml` if your site allows more. Note the array
+   is sized by **conditions, not conditions × seeds**: seeds are baked into
+   each input JSON, so more seeds make each task longer rather than adding
+   tasks. Packing removes the limit from the inference stage entirely.
 
 6. **A mutant or truncation needs its own MSA.** An AF3 MSA must match its
    query exactly, so it can never be reused across a sequence change. Changing
