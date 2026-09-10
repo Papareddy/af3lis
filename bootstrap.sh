@@ -39,8 +39,12 @@ find_mgr() {
 }
 
 # Can we hardlink from $1 into $2? The only reliable same-fileset test.
+# NB the two probe filenames must DIFFER: when $1 and $2 are the same
+# directory (the normal case, since the cache sits beside the prefix) an
+# identical name makes `ln` fail with EEXIST and the test would always report
+# "no hardlink support" and needlessly fall back to --copy.
 can_hardlink() {
-  local a="$1/.af3lis_ln_$$" b="$2/.af3lis_ln_$$"
+  local a="$1/.af3lis_ln_src_$$" b="$2/.af3lis_ln_dst_$$"
   mkdir -p "$1" "$2" 2>/dev/null || return 1
   : > "$a" 2>/dev/null || return 1
   if ln "$a" "$b" 2>/dev/null; then rm -f "$a" "$b"; return 0; fi
