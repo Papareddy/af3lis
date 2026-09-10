@@ -71,8 +71,9 @@ flowchart TD
 
     subgraph S["SLURM"]
         A["<b>1. ALIGN</b>  CPU array<br/>jackhmmer/nhmmer MSA + templates<br/>pair mode: 1 task per pair -> out/<br/>monomer mode: 1 task per chain -> msa/<br/><i>the long stage, ~19 min/task measured</i>"]
-        A -->|afterany| B["<b>2. BRIDGE</b>  1 CPU job, 30 min<br/>monomer mode only: merge_af3_multimer<br/>splices chain MSAs into out/<br/>then groups pairs by token bucket,<br/>sizes walltime, picks gres/mem"]
+        A -->|afterany| B["<b>2. BRIDGE</b>  1 CPU job, 30 min<br/>monomer mode only: merge_af3_multimer<br/>splices chain MSAs into out/<br/>then groups pairs by token bucket,<br/>sizes walltime, picks gres/mem<br/><i>and submits stages 3 AND 4</i>"]
         B -->|submits| G["<b>3. INFERENCE</b>  packed GPU jobs<br/>run_alphafold.py --input_dir<br/>weights load once per job<br/>XLA compiles once per bucket"]
+        B -.->|"submits, afterany on all groups"| N
         G -->|afterany| N["<b>4. ANALYSE</b>  CPU job<br/>lis.py + PEAK + ipsae.py<br/>figures · CIF-&gt;PDB"]
     end
 
@@ -86,6 +87,15 @@ flowchart TD
     style N fill:#f7d9c9,stroke:#eb6834
     style O fill:#d6f0e4,stroke:#1baf7a
 ```
+
+**Why the bridge submits the analyse stage too.** The packed GPU jobs do not
+exist until the bridge runs, so their job ids are unknown when the campaign is
+submitted. Analyse therefore cannot be chained up front — it has to be
+submitted *by* the bridge, with an `afterany` dependency on the group ids that
+`submit_all.sh` captures into `af3pack/job_ids.txt`. Chaining it on the bridge
+instead looks right and is wrong: the bridge exits in seconds, so analyse fires
+before inference has started and dies with "no models". That was a real bug,
+caught by the first end-to-end run rather than by any dry run.
 
 **Why a bridge job rather than one big array.** Token counts are only known
 after the MSAs exist, so the grouping decision cannot be made at submit time.

@@ -229,7 +229,12 @@ def write_submit(groups: list[dict],
     lines = ["#!/bin/bash",
              "set -e",
              f"# packed AF3 inference -- {len(groups)} jobs; keep <= ~100 pending",
-             f"# (bwHelix MaxJobsAccruePU=100; trickle-submit if you queue more elsewhere)"]
+             f"# (bwHelix MaxJobsAccruePU=100; trickle-submit if you queue more elsewhere)",
+             "#",
+             "# Job ids are captured to job_ids.txt because the ANALYSE stage must",
+             "# depend on these jobs, and their ids do not exist until this script",
+             "# runs -- so analyse cannot be chained when the campaign is submitted.",
+             'IDS=""']
     for g in groups:
         r = resources_for(g["bucket"])
         # sbatch CLI flags override the #SBATCH directives rendered from
@@ -237,13 +242,19 @@ def write_submit(groups: list[dict],
         # as env vars the template reads with a config-rendered fallback.
         lines.append(
             f"# bucket {r['bucket']}: {r['note']}\n"
-            f"sbatch --time={g['walltime']} "
+            f"IDS=\"$IDS $(sbatch --parsable --time={g['walltime']} "
             f"--gres={r['gres']} --mem={r['mem']} "
             f"--export=ALL,AF3LIS_FLASH_ATTN={r['flash_attn']},"
             f"AF3LIS_XLA_MEM_FRAC={r['xla_mem_frac']} "
             f"--job-name=af3pack_{os.path.basename(g['dir'])} "
-            f"{sbatch_path} {g['dir']} {out_pack}"
+            f"{sbatch_path} {g['dir']} {out_pack})\""
         )
+    lines += [
+        "",
+        "# leave the ids where the bridge can pick them up",
+        f'printf "%s\\n" $IDS > "{os.path.join(pack_root, "job_ids.txt")}"',
+        'echo "PACK_SUBMITTED$IDS"',
+    ]
     sub = os.path.join(pack_root, "submit_all.sh")
     with open(sub, "w") as fh:
         fh.write("\n".join(lines) + "\n")

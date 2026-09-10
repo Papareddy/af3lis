@@ -273,6 +273,42 @@ def test_monomer_mode_dedups_and_merges_correctly():
     assert n2 == 4 and len(miss2) == 2, (n2, miss2)
 
 
+def test_submit_all_captures_job_ids_for_analyse_chaining():
+    """The packed group ids must be captured, because ANALYSE has to depend on
+    them and they do not exist until submit_all.sh runs. Chaining analyse on
+    the bridge instead was a real bug: the bridge exits in seconds, so analyse
+    ran before any model existed and died with "no models"."""
+    import os, tempfile, subprocess, sys
+    from af3lis.pack import write_submit
+    d = tempfile.mkdtemp()
+    groups = [dict(dir=os.path.join(d, "group_000_b512"), bucket=512,
+                   members=["a___b"], est_s=600.0, walltime="00:30:00"),
+              dict(dir=os.path.join(d, "group_001_b768"), bucket=768,
+                   members=["c___d"], est_s=900.0, walltime="00:45:00")]
+    sub = write_submit(groups, d, os.path.join(d, "pack_infer.sbatch"),
+                       os.path.join(d, "out_pack"), 90)
+    txt = open(sub).read()
+    assert "--parsable" in txt, "ids cannot be captured without --parsable"
+    assert "job_ids.txt" in txt, "no id file written"
+    assert txt.count("IDS=") >= 3, "ids not accumulated per group"
+
+    # run it with a stub sbatch on PATH and check the id file lands
+    bindir = os.path.join(d, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    stub = os.path.join(bindir, "sbatch")
+    with open(stub, "w") as fh:
+        fh.write("#!/bin/sh\necho 99$$\n")
+    os.chmod(stub, 0o755)
+    env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"])
+    r = subprocess.run(["bash", sub], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    idf = os.path.join(d, "job_ids.txt")
+    assert os.path.exists(idf), "job_ids.txt not created"
+    ids = [x for x in open(idf).read().split() if x]
+    assert len(ids) == 2, f"expected 2 ids, got {ids}"
+    assert "PACK_SUBMITTED" in r.stdout
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

@@ -55,4 +55,26 @@ SUBMIT="{OUTDIR}/af3pack/submit_all.sh"
 [ -r "$SUBMIT" ] || {{ echo "ERROR: pack produced no $SUBMIT" >&2; exit 4; }}
 echo "== submitting packed groups =="
 bash "$SUBMIT"
+
+# --- chain the ANALYSE stage onto the groups we just submitted --------------
+# This CANNOT be done when the campaign is submitted: the packed group jobs do
+# not exist until this bridge runs, so their ids are unknown. Chaining analyse
+# on the bridge instead is wrong and was a real bug -- the bridge exits in
+# seconds, so analyse fired before inference had even started and died with
+# "no models".
+IDFILE="{OUTDIR}/af3pack/job_ids.txt"
+ANALYSE="{OUTDIR}/analyse.sbatch"
+if [ -s "$IDFILE" ] && [ -r "$ANALYSE" ]; then
+    DEP=$(tr '\n' ':' < "$IDFILE" | sed 's/^://; s/:$//')
+    if [ -n "$DEP" ]; then
+        # afterany, not afterok: score whatever finished rather than stranding
+        # the stage when one GPU group fails.
+        AID=$(sbatch --parsable --dependency=afterany:"$DEP" "$ANALYSE")
+        echo "PACK_BRIDGE_ANALYSE job=$AID deps=$DEP"
+    else
+        echo "WARNING: $IDFILE empty; analyse NOT chained" >&2
+    fi
+else
+    echo "WARNING: no job_ids.txt or analyse.sbatch; analyse NOT chained" >&2
+fi
 echo "PACK_BRIDGE_EXIT=0"

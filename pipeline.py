@@ -613,7 +613,13 @@ def cmd_submit(outdir: str,
 
     # ---- final stage: score + plot + PDB, afterany on inference ----
     analyse_sb = os.path.join(outdir, "analyse.sbatch")
-    if analyse and not align_only and os.path.exists(analyse_sb):
+    # In the PACKED route the bridge submits analyse, because only it knows the
+    # group job ids. Pre-submitting here would chain analyse on the BRIDGE,
+    # which exits in seconds -- analyse would then run before any model exists.
+    if analyse and not align_only and not array_infer:
+        print("analyse: will be submitted by the bridge, chained on the packed "
+              "GPU groups (their ids do not exist yet)")
+    if analyse and array_infer and not align_only and os.path.exists(analyse_sb):
         # afterany again: score whatever finished rather than hanging when one
         # GPU group fails. The job itself refuses to run if no models exist.
         n_args = ["sbatch", "--parsable"]
