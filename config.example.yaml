@@ -27,7 +27,14 @@ seq_cache: /path/to/seq_cache
 
 # ----- SLURM: alignment stage (CPU MSA + templates) -----
 align_partition: cpu-single
-align_time: 12:00:00
+# MEASURED on bwHelix (smoke run 14736441, 12 pairs of 76-440 aa chains):
+# 15-39 min per pair, mean ~19 min, against the old blind 12:00:00 default.
+# Over-asking shrinks backfill eligibility, so this is now 6h -- generous for
+# ordinary chains while still leaving headroom, because jackhmmer time tracks
+# the NUMBER OF HOMOLOGS FOUND rather than query length and is therefore not
+# predictable from the input. Raise it for very long chains (>1500 aa) or
+# large families; a task killed on walltime writes no MSA at all.
+align_time: 06:00:00
 align_mem: 64gb
 align_cpus: 16
 # Extra flags appended to the alignment stage (e.g. --max_template_date=2024-01-01).

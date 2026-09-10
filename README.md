@@ -110,6 +110,13 @@ every input up to the next bucket on its ladder
 | 2048–3072 | `gpu:A100:1` | 60gb | `triton` | 3.2 | still under the 64 GB cutoff; more host RAM for unified-memory spill |
 | ≥ 4096 | `gpu:A100:1` | 96gb | `xla` | 4.0 | needs an 80 GB card (gpu8) and the XLA attention kernel |
 
+> **How much of the ladder is measured?** The ≤1536 / 48gb tier encodes Mau's
+> own documented constraint and his measured queue behaviour. The 2048–3072 and
+> ≥4096 tiers are **extrapolations**, not measurements — his timing table
+> covers buckets 512 and 768 only, and a 5-seed run confirmed the extrapolated
+> buckets over-ask by ~2.4×. Run `--probe` + `calibrate.py` before trusting
+> them on a new size class.
+
 **The memory ladder is not "bigger is safer".** On bwHelix, asking for
 **≥ 64 GB excludes the 26 abundant 40 GB gpu4 nodes** and restricts the job to
 4 scarce gpu8 nodes. A needlessly large `--mem` therefore costs hours of queue
@@ -126,6 +133,31 @@ group             bucket  n_conditions  est_min  walltime  gres        mem    fl
 group_000_b768    768     6             44.7     01:00:00  gpu:A100:1  48gb   triton      3.2           ...
 group_003_b4096   4096    2             180.0    04:00:00  gpu:A100:1  96gb   xla         4.0           ...
 ```
+
+### Whose strategy this is
+
+Both compute stages follow **Mau's bwHelix AF3 toolkit** (personal
+communication, Aug 2026):
+
+* **align** — one CPU array task per input JSON, exactly as his
+  `AF3_data_CPU_helix.sh` does.
+* **inference** — packed via `run_alphafold.py --input_dir`, adopting his
+  `af3_group.py` size-aware grouping and his measured bwHelix queue numbers.
+
+What af3lis adds is scaffolding rather than strategy: the `afterany` bridge so
+packing happens automatically instead of by hand, the chained analyse stage,
+the array-size guard, and the smoke test. One exception is flagged below.
+
+> **Known gap: chain-level MSA de-duplication.** AF3's data pipeline runs per
+> input JSON and aligns every chain in it, so a sequence is re-aligned once per
+> pair it appears in — 2× redundant for a 1 × 1000 grid, 4× for 2 × 500, 28×
+> for 20 × 50. Mau's toolkit contains `merge_af3_multimer_v6.py`, which merges
+> monomer `_data.json` files into multimers and is exactly the fix; it is one
+> of the scripts his README says must be requested separately, and it has not
+> been vendored here. Until it is, expect the redundancy above. A from-scratch
+> reimplementation was deliberately **not** shipped: it would silently corrupt
+> every MSA in a screen if the per-chain `pairedMsa` semantics differ from a
+> single inspected example.
 
 ### Why inference is packed, not one job per fold
 
