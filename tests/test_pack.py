@@ -210,6 +210,69 @@ def test_smoke_fixture_parses():
     assert na == 2 and nb == 6, f"expected 2 baits x 6 preys, got {na}x{nb}"
 
 
+def test_monomer_mode_dedups_and_merges_correctly():
+    """Monomer alignment: one input per unique chain, and the merge must put
+    the right MSA on the right chain. A silent chain swap here would corrupt
+    every fold in a screen, so this asserts identity, not just plumbing."""
+    import json, os, tempfile, glob, sys, subprocess
+    from af3lis import monomer
+
+    d = tempfile.mkdtemp()
+    jd = os.path.join(d, "jsons")
+    os.makedirs(jd)
+    # 2 baits x 3 preys: 6 pairs, 12 chain-MSAs per-pair, 5 unique -> 2.4x
+    baits = {"BAITX": "MKVLSPADKTNV", "BAITY": "MVHLTPEEKSAV"}
+    preys = {"PREY1": "MSEQLTNAVLDA", "PREY2": "MQIFVKTLTGKT", "PREY3": "MADQLTEEQIAE"}
+    for bn, bs in baits.items():
+        for pn, ps in preys.items():
+            nm = f"{bn}___{pn}"
+            json.dump({"name": nm, "dialect": "alphafold3", "version": 1,
+                       "modelSeeds": [1],
+                       "sequences": [{"protein": {"id": "A", "sequence": bs}},
+                                     {"protein": {"id": "B", "sequence": ps}}]},
+                      open(os.path.join(jd, nm + ".json"), "w"))
+
+    lf, n = monomer.write_monomers(d, [1])
+    assert n == 5, f"expected 5 unique chains, got {n}"
+    assert len(open(lf).read().split()) == 5
+
+    # fake AF3 align output, embedding the query so the merge can be audited
+    for mp in glob.glob(os.path.join(d, "monomers", "*.json")):
+        md = json.load(open(mp))
+        lab = md["name"]
+        p = md["sequences"][0]["protein"]
+        p["unpairedMsa"] = f">q\n{p['sequence']}\n"
+        p["pairedMsa"] = f">q\n{p['sequence']}\n"
+        p["templates"] = []
+        od = os.path.join(d, "msa", lab)
+        os.makedirs(od, exist_ok=True)
+        json.dump(md, open(os.path.join(od, f"{lab}_data.json"), "w"))
+
+    nmerged, missing = monomer.merge_all(d, [1], python_exe=sys.executable)
+    assert nmerged == 6 and not missing, (nmerged, missing)
+
+    for mp in glob.glob(os.path.join(d, "out", "*", "*_data.json")):
+        md = json.load(open(mp))
+        prot = [x["protein"] for x in md["sequences"] if "protein" in x]
+        assert len(prot) == 2
+        assert [x["id"] for x in prot] == ["A", "B"]
+        lname = os.path.basename(os.path.dirname(mp))
+        want = json.load(open(os.path.join(jd, lname.upper() + ".json")))
+        wseq = [x["protein"]["sequence"] for x in want["sequences"]]
+        assert [x["sequence"] for x in prot] == wseq, "chain order/sequence swapped"
+        for x in prot:
+            # the MSA carried onto this chain must be the one built FOR it
+            q = x["unpairedMsa"].split("\n")[1]
+            assert q == x["sequence"], "MSA belongs to a different sequence"
+
+    # a missing chain MSA is reported, not fatal, and does not fake a result
+    import shutil
+    shutil.rmtree(glob.glob(os.path.join(d, "msa", "prey1*"))[0])
+    shutil.rmtree(os.path.join(d, "out"))
+    n2, miss2 = monomer.merge_all(d, [1], python_exe=sys.executable)
+    assert n2 == 4 and len(miss2) == 2, (n2, miss2)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

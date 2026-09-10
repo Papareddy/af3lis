@@ -148,16 +148,46 @@ What af3lis adds is scaffolding rather than strategy: the `afterany` bridge so
 packing happens automatically instead of by hand, the chained analyse stage,
 the array-size guard, and the smoke test. One exception is flagged below.
 
-> **Known gap: chain-level MSA de-duplication.** AF3's data pipeline runs per
-> input JSON and aligns every chain in it, so a sequence is re-aligned once per
-> pair it appears in — 2× redundant for a 1 × 1000 grid, 4× for 2 × 500, 28×
-> for 20 × 50. Mau's toolkit contains `merge_af3_multimer_v6.py`, which merges
-> monomer `_data.json` files into multimers and is exactly the fix; it is one
-> of the scripts his README says must be requested separately, and it has not
-> been vendored here. Until it is, expect the redundancy above. A from-scratch
-> reimplementation was deliberately **not** shipped: it would silently corrupt
-> every MSA in a screen if the per-chain `pairedMsa` semantics differ from a
-> single inspected example.
+### Monomer-first alignment (`--align-mode monomer`)
+
+AF3's data pipeline aligns every chain in each input JSON, so a pairwise grid
+re-aligns the same sequence once per pair it appears in:
+
+| grid | pairs | chain-MSAs | unique | redundant |
+|---|---|---|---|---|
+| 1 × 1000 | 1000 | 2000 | 1001 | 2.0× |
+| 2 × 500 | 1000 | 2000 | 502 | **4.0×** |
+| 5 × 200 | 1000 | 2000 | 205 | **9.8×** |
+| 20 × 50 | 1000 | 2000 | 70 | **28.6×** |
+
+A bait in a 1 × 1000 screen is aligned a thousand times, and alignment is the
+long pole of the pipeline. `--align-mode monomer` aligns each **unique chain
+once** and then reassembles the pair inputs with Mau's
+`merge_af3_multimer_v6.py`, vendored verbatim as
+`af3lis/merge_af3_multimer.py`:
+
+```bash
+bash af3lis.sh run --chains-tsv chains.tsv --name MyScreen --align-mode monomer
+# build reports:  12 pairs would need 24 chain-MSAs; 8 unique -> 3.0x less alignment
+# align array is sized 1-8 instead of 1-12; the bridge merges before packing
+```
+
+Layout differs only in the align stage: monomer inputs in `monomers/`, their
+MSAs in `msa/<chain>/`, and the bridge writes the merged pairs to the usual
+`out/<pair>/<pair>_data.json`, so packing, scoring and plotting are unchanged.
+
+**Why splicing is sound.** In a pair `_data.json` each protein chain carries
+its own `unpairedMsa`, `pairedMsa` and `templates`; the two chains' `pairedMsa`
+values differ from each other and from their `unpairedMsa`. `pairedMsa` is the
+per-chain UniProt search result — the hits whose species annotations AF3 needs
+— and the cross-chain **pairing happens later, at featurisation**. So a chain's
+MSA payload does not depend on what it was aligned alongside. This was checked
+against real AF3 output, and the test suite asserts the merge puts each MSA
+back on the chain it was built for, because a silent chain swap here would
+corrupt every fold in a screen.
+
+`pair` remains the default until monomer mode has a green smoke run on your
+cluster; both modes are covered by `tests/test_pack.py`.
 
 ### Why inference is packed, not one job per fold
 

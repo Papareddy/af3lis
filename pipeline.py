@@ -204,7 +204,19 @@ def render_sbatches(jobs: list[tuple[str, str]],
         DB_DIR=cfg["db_dir"],
         MODEL_DIR=cfg["model_dir"],
     )
+    # align stage source/destination: pair mode aligns the pair JSONs into
+    # out/; monomer mode aligns one input per unique chain into msa/ and the
+    # bridge merges them back into out/ afterwards.
+    _mode = cfg.get("align_mode", "pair")
     align_map = dict(common,
+                     ALIGN_LIST=cfg.get(
+                         "align_list",
+                         os.path.abspath(os.path.join(
+                             outdir,
+                             "af3_monomer_list.txt" if _mode == "monomer"
+                             else "af3_json_list.txt"))),
+                     ALIGN_OUT=os.path.abspath(os.path.join(
+                         outdir, "msa" if _mode == "monomer" else "out")),
                      ALIGN_PARTITION=cfg["align_partition"],
                      ALIGN_TIME=cfg["align_time"],
                      ALIGN_MEM=cfg["align_mem"],
@@ -450,6 +462,22 @@ def cmd_submit(outdir: str,
         raise SystemExit("%s is empty -- nothing to submit" % listfile)
     n = len(paths)
 
+    # In monomer mode the ALIGN array covers unique chains, not pairs, so it is
+    # sized from the monomer list. Everything downstream still counts pairs.
+    align_mode, align_list = "pair", listfile
+    mode_marker = os.path.join(outdir, ".af3lis_align_mode")
+    if os.path.exists(mode_marker):
+        with open(mode_marker) as fh:
+            lines = [l.strip() for l in fh if l.strip()]
+        if lines and lines[0] == "monomer":
+            align_mode = "monomer"
+            if len(lines) > 1 and os.path.exists(lines[1]):
+                align_list = lines[1]
+    n_align = len(_read_list(align_list)) if align_mode == "monomer" else n
+    if align_mode == "monomer":
+        print("align mode=monomer: %d unique chains for %d pairs "
+              "(%.1fx less alignment)" % (n_align, n, (2 * n) / max(n_align, 1)))
+
     # --- array-size guard -------------------------------------------------
     # SLURM refuses --array=1-N above MaxArraySize (1001 on bwHelix) and the
     # rejection is easy to miss: the align array never runs, the afterany
@@ -515,7 +543,7 @@ def cmd_submit(outdir: str,
     cmds_log: list[str] = []
 
     if not infer_only and os.path.exists(align_sb):
-        a_args = ["sbatch", "--parsable", "--array=1-%d" % n]
+        a_args = ["sbatch", "--parsable", "--array=1-%d" % n_align]
         if time_align:
             a_args += ["--time=" + time_align]
         a_args += [align_sb]
@@ -664,6 +692,12 @@ def _build_argparser() -> argparse.ArgumentParser:
                     help="submit the pipeline: align array -> PACKED GPU "
                          "inference via a bridge job (default). Use "
                          "--array-infer for the legacy per-task infer array.")
+    ap.add_argument("--align-mode", choices=("pair", "monomer"), default=None,
+                    help="pair (default): AF3 aligns both chains of every pair, "
+                         "so a sequence is re-aligned once per pair it appears "
+                         "in. monomer: align each UNIQUE chain once, then "
+                         "reassemble pairs with Mau's merge_af3_multimer "
+                         "(2-28x less alignment depending on grid shape).")
     ap.add_argument("--no-analyse", action="store_true",
                     help="with --submit: do NOT chain the final scoring/plot/PDB job")
     ap.add_argument("--array-infer", action="store_true",
@@ -848,6 +882,8 @@ def main() -> None:
 
     os.makedirs(a.outdir, exist_ok=True)
     os.makedirs(os.path.join(a.outdir, "logs"), exist_ok=True)
+    align_mode = a.align_mode or cfg.get("align_mode", "pair")
+    cfg = dict(cfg, align_mode=align_mode)
     os.makedirs(os.path.join(a.outdir, "out"), exist_ok=True)
 
     A = fetch.resolve_chain(a.chainA, a.cache, overrides,
@@ -876,6 +912,23 @@ def main() -> None:
           "--array=1-%d %s)" % (infer_sb, len(jobs), infer_sb))
     print("list file    -> %s" % listfile)
     print("runbook      -> %s" % runbook)
+
+    # --- monomer mode: one align input per UNIQUE chain -------------------
+    # Done AFTER the pair JSONs exist, because they are what defines the
+    # chain set and stays authoritative for naming and token counts.
+    if align_mode == "monomer":
+        from af3lis import monomer
+        mono_list, n_mono = monomer.write_monomers(a.outdir, seeds)
+        # the align array must now cover monomers, not pairs
+        render_sbatches(jobs, a.outdir, a.name,
+                        dict(cfg, align_mode="monomer", align_list=mono_list))
+        with open(os.path.join(a.outdir, ".af3lis_align_mode"), "w") as fh:
+            fh.write("monomer\n%s\n%d\n" % (mono_list, n_mono))
+        print("monomer list -> %s   (align with --array=1-%d)"
+              % (mono_list, n_mono))
+    else:
+        with open(os.path.join(a.outdir, ".af3lis_align_mode"), "w") as fh:
+            fh.write("pair\n")
     print("\nNext: sync %s to the cluster, then either follow RUNBOOK.md or "
           "run `python pipeline.py --submit --outdir %s`."
           % (a.outdir, a.outdir))

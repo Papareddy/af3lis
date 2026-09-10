@@ -36,6 +36,19 @@ PY="${{AF3LIS_PYTHON:-python3}}"
 echo "NODE=$(hostname) PIPE=$PIPE PY=$PY OUTDIR={OUTDIR}"
 
 cd "$PIPE"
+
+# --- monomer mode: rebuild the pair inputs from the cached chain MSAs -------
+# In monomer mode the align array produced one MSA per UNIQUE chain under
+# msa/, not one per pair under out/. Reassemble the pairs with Mau's
+# merge_af3_multimer before packing. A pair whose chains are missing is
+# reported and skipped, so a partial align still yields a partial campaign.
+if [ -f "{OUTDIR}/.af3lis_align_mode" ] && \
+   head -1 "{OUTDIR}/.af3lis_align_mode" | grep -q monomer; then
+    echo "== monomer mode: merging cached chain MSAs into pair inputs =="
+    "$PY" -m af3lis.monomer merge "{OUTDIR}" --python "$PY" || {{
+        echo "ERROR: merge step failed; nothing to pack" >&2; exit 7; }}
+fi
+
 "$PY" pipeline.py --pack --outdir "{OUTDIR}" --target-hours {TARGET_HOURS}
 
 SUBMIT="{OUTDIR}/af3pack/submit_all.sh"
