@@ -61,20 +61,25 @@ flowchart TD
         R["af3lis.sh run"]
         T --> R
         R --> RES["resolve IDs<br/>UniProt REST · TAIR xref<br/>FASTA · inline sequence<br/><i>cached in seq_cache/</i>"]
-        RES --> J["build AF3 input JSONs<br/>one per chain pair<br/>seeds baked in"]
+        RES --> J["build pair JSONs<br/>jsons/&lt;A&gt;___&lt;B&gt;.json<br/>seeds baked in<br/><i>authoritative for naming + token counts</i>"]
+        J --> MODE{"--align-mode"}
+        MODE -->|"monomer"| MM["monomers/&lt;chain&gt;.json<br/>one per UNIQUE sequence<br/><i>2-28x fewer alignments</i>"]
     end
 
-    J --> A
+    J -->|"pair (default)"| A
+    MM --> A
 
     subgraph S["SLURM"]
-        A["<b>1. ALIGN</b>  CPU array<br/>jackhmmer/nhmmer MSA + templates<br/>one task per pair<br/><i>the long stage</i>"]
-        A -->|afterany| B["<b>2. BRIDGE</b>  1 CPU job, 30 min<br/>reads token counts, groups pairs<br/>into single-bucket GPU jobs<br/>sizes walltime + picks resources"]
+        A["<b>1. ALIGN</b>  CPU array<br/>jackhmmer/nhmmer MSA + templates<br/>pair mode: 1 task per pair -> out/<br/>monomer mode: 1 task per chain -> msa/<br/><i>the long stage, ~19 min/task measured</i>"]
+        A -->|afterany| B["<b>2. BRIDGE</b>  1 CPU job, 30 min<br/>monomer mode only: merge_af3_multimer<br/>splices chain MSAs into out/<br/>then groups pairs by token bucket,<br/>sizes walltime, picks gres/mem"]
         B -->|submits| G["<b>3. INFERENCE</b>  packed GPU jobs<br/>run_alphafold.py --input_dir<br/>weights load once per job<br/>XLA compiles once per bucket"]
-        G -->|afterany| N["<b>4. ANALYSE</b>  CPU job<br/>lis.py + PEAK + ipsae.py<br/>figures · CIF→PDB"]
+        G -->|afterany| N["<b>4. ANALYSE</b>  CPU job<br/>lis.py + PEAK + ipsae.py<br/>figures · CIF-&gt;PDB"]
     end
 
     N --> O["metrics.tsv · figures/ · *.pdb"]
 
+    style MODE fill:#fff,stroke:#4a3aa7
+    style MM fill:#ede9fb,stroke:#4a3aa7
     style A fill:#cde2fb,stroke:#2a78d6
     style B fill:#e9e8e4,stroke:#9b9a95
     style G fill:#2a78d6,stroke:#104281,color:#fff
@@ -495,9 +500,10 @@ workspace:  /gpfs/.../hd_xxx-af3    # runs land in <workspace>/runs/<name>
 
 # --- align stage (CPU)
 align_partition: cpu-single
-align_time: 12:00:00
-align_mem: 64gb                     # jackhmmer memory tracks HOMOLOG COUNT, not
-align_cpus: 8                       # query length -- 40gb+ or you will get OOMs
+align_time: 06:00:00                # measured ~19 min/pair for 76-440 aa chains;
+                                    # generous because jackhmmer time tracks
+align_mem: 64gb                     # HOMOLOG COUNT, not query length -- which is
+align_cpus: 8                       # also why you want 40gb+ or you will get OOMs
 
 # --- inference stage (GPU) -- fallbacks; af3lis.pack overrides per bucket
 infer_partition: gpu-single
