@@ -131,11 +131,18 @@ def test_resources_for_ladder():
         mem_gb = int(r["mem"].replace("gb", ""))
         assert mem_gb < 64, (b, r["mem"])
         assert r["flash_attn"] == "triton"
+        # must NOT pin a card type: measured on bwHelix, pinning A100 costs
+        # ~2h15m of queue and A40 ~3h23m versus an unpinned request, for no
+        # benefit at these sizes.
+        assert r["gres"] == "gpu:1", (b, r["gres"])
     # big buckets escalate deliberately
     for b in (4096, 5120, 8192):
         r = resources_for(b)
         assert int(r["mem"].replace("gb", "")) >= 64
         assert r["flash_attn"] == "xla"
+        # big models DO pin, because gpumem_per_gpu does not influence
+        # scheduling on this cluster and >=64gb is what reaches the gpu8 nodes
+        assert ":" in r["gres"] and r["gres"] != "gpu:1", (b, r["gres"])
         assert r["xla_mem_frac"] >= 3.2
     # monotonic, and every bucket resolves
     prev = 0

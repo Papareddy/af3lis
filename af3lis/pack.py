@@ -61,14 +61,34 @@ DEFAULT_CALIB = {256: 15, 512: 35, 768: 85, 1024: 160, 1280: 260, 1536: 380,
 # costs hours of queue. Small buckets therefore stay at 48 GB deliberately;
 # only >= 4096 tokens escalates, because those genuinely need an 80 GB card.
 #
+# Do NOT pin a GPU type unless the size class needs one. Measured with
+# `sbatch --test-only` on bwHelix, same job, same --mem:
+#
+#     --gres=gpu:1        start 2026-10-03T21:22   <- earliest
+#     --gres=gpu:A100:1   start 2026-10-03T23:37   (+2h15m)
+#     --gres=gpu:A40:1    start 2026-10-04T00:45   (+3h23m)
+#
+# Pinning costs queue time for no benefit below ~3072 tokens: every GPU type on
+# this cluster (a100 / a40 / h200) is Ampere+ so Triton flash-attention works on
+# all of them, and all carry >= 40 GB, which AF3 clears for ~3100-residue
+# complexes with unified memory enabled. Small jobs are minutes of compute
+# after days of queue -- 2:25 and 1:44 for the b256 and b512 groups of the
+# smoke run -- so backfill eligibility dominates everything else.
+#
+# NB `gpumem_per_gpu` does NOT influence scheduling here: 40G/48G/80G all
+# return the same estimate as an unpinned request, so it cannot be used to
+# guarantee a large card. Above 4096 tokens the type is pinned explicitly and
+# --mem is the real lever (>=64gb restricts to the scarce gpu8 nodes, which is
+# exactly what a big model needs and what a small one must avoid).
+#
 # (bucket_max, gres, mem, flash_attn, xla_mem_frac, note)
 RESOURCE_LADDER = [
-    (1536, "gpu:A100:1", "48gb", "triton", 3.2,
-     "fits A100-40GB; 48gb keeps the abundant gpu4 nodes eligible"),
-    (3072, "gpu:A100:1", "60gb", "triton", 3.2,
-     "still under the 64gb gpu4 cutoff; more host RAM for unified-memory spill"),
+    (1536, "gpu:1", "48gb", "triton", 3.2,
+     "any GPU type; 48gb keeps the abundant gpu4 nodes eligible"),
+    (3072, "gpu:1", "60gb", "triton", 3.2,
+     "any GPU type, still under the 64gb gpu4 cutoff; more host RAM for spill"),
     (10 ** 9, "gpu:A100:1", "96gb", "xla", 4.0,
-     ">=4096 tokens: needs an 80GB card (gpu8) and the XLA attention kernel"),
+     ">=4096 tokens: pin A100 and take the gpu8 nodes via >=64gb; XLA kernel"),
 ]
 
 

@@ -121,9 +121,32 @@ every input up to the next bucket on its ladder
 
 | tokens (bucket) | `--gres` | `--mem` | flash attention | `XLA_CLIENT_MEM_FRACTION` | why |
 |---|---|---|---|---|---|
-| ≤ 1536 | `gpu:A100:1` | **48gb** | `triton` | 3.2 | fits a 40 GB card; 48 GB keeps the **26 abundant gpu4 nodes** eligible |
-| 2048–3072 | `gpu:A100:1` | 60gb | `triton` | 3.2 | still under the 64 GB cutoff; more host RAM for unified-memory spill |
-| ≥ 4096 | `gpu:A100:1` | 96gb | `xla` | 4.0 | needs an 80 GB card (gpu8) and the XLA attention kernel |
+| ≤ 1536 | **`gpu:1`** | **48gb** | `triton` | 3.2 | any GPU type; 48 GB keeps the **26 abundant gpu4 nodes** eligible |
+| 2048–3072 | **`gpu:1`** | 60gb | `triton` | 3.2 | any type, still under the 64 GB cutoff; more host RAM for spill |
+| ≥ 4096 | `gpu:A100:1` | 96gb | `xla` | 4.0 | pin A100 and reach the gpu8 nodes via ≥64 GB; XLA attention kernel |
+
+**Don't pin a GPU type unless the size class needs one.** Measured with
+`sbatch --test-only`, same job, same `--mem`:
+
+| request | estimated start |
+|---|---|
+| `--gres=gpu:1` | 2026-10-03 21:22 — **earliest** |
+| `--gres=gpu:A100:1` | 2026-10-03 23:37 (+2h15m) |
+| `--gres=gpu:A40:1` | 2026-10-04 00:45 (+3h23m) |
+
+Pinning buys nothing below ~3072 tokens: every GPU type here (a100 / a40 /
+h200) is Ampere+ so Triton flash-attention works on all of them, and all carry
+≥ 40 GB, which AF3 clears for ~3100-residue complexes with unified memory on.
+And the asymmetry is stark — in the smoke run the b256 and b512 groups computed
+in **2:25 and 1:44 after queueing for a day**, so backfill eligibility
+dominates everything else. Note A40 is *worse* than A100 on this cluster, so
+"use the smaller card" is the wrong instinct; "don't ask for a specific card"
+is the right one.
+
+`gpumem_per_gpu` does **not** influence scheduling here — 40G, 48G and 80G all
+return the same estimate as an unpinned request — so it cannot be used to
+guarantee a large card. Above 4096 tokens the type is pinned explicitly, and
+`--mem` remains the real lever.
 
 > **How much of the ladder is measured?** The ≤1536 / 48gb tier encodes Mau's
 > own documented constraint and his measured queue behaviour. The 2048–3072 and
