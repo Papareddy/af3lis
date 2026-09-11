@@ -140,10 +140,15 @@ def test_resources_for_ladder():
         r = resources_for(b)
         assert int(r["mem"].replace("gb", "")) >= 64
         assert r["flash_attn"] == "xla"
-        # big models DO pin, because gpumem_per_gpu does not influence
-        # scheduling on this cluster and >=64gb is what reaches the gpu8 nodes
-        assert ":" in r["gres"] and r["gres"] != "gpu:1", (b, r["gres"])
+        # big models must ALSO stay unpinned: A100 is the contended card and
+        # pinning it costs ~2h of queue versus an unpinned request, while
+        # --mem >=64gb is what actually reaches the large nodes.
+        assert r["gres"] == "gpu:1", (b, r["gres"])
         assert r["xla_mem_frac"] >= 3.2
+    # no tier anywhere may name a card type
+    for b in (256, 1536, 3072, 4096, 8192):
+        assert resources_for(b)["gres"] == "gpu:1", b
+
     # monotonic, and every bucket resolves
     prev = 0
     for b in (256, 1536, 3072, 4096):

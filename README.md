@@ -123,10 +123,10 @@ every input up to the next bucket on its ladder
 |---|---|---|---|---|---|
 | ≤ 1536 | **`gpu:1`** | **48gb** | `triton` | 3.2 | any GPU type; 48 GB keeps the **26 abundant gpu4 nodes** eligible |
 | 2048–3072 | **`gpu:1`** | 60gb | `triton` | 3.2 | any type, still under the 64 GB cutoff; more host RAM for spill |
-| ≥ 4096 | `gpu:A100:1` | 96gb | `xla` | 4.0 | pin A100 and reach the gpu8 nodes via ≥64 GB; XLA attention kernel |
+| ≥ 4096 | **`gpu:1`** | 96gb | `xla` | 4.0 | any type; ≥64 GB reaches the large nodes, XLA kernel + a 4.0 unified-memory pool covers a smaller card |
 
-**Don't pin a GPU type unless the size class needs one.** Measured with
-`sbatch --test-only`, same job, same `--mem`:
+**The ladder never names a card.** Measured with `sbatch --test-only`, same
+job, same `--mem`:
 
 | request | estimated start |
 |---|---|
@@ -143,10 +143,29 @@ dominates everything else. Note A40 is *worse* than A100 on this cluster, so
 "use the smaller card" is the wrong instinct; "don't ask for a specific card"
 is the right one.
 
+The same holds at the big-model tier, where pinning is the intuitive move and
+still the wrong one (`--mem=96gb` throughout):
+
+| request | estimated start |
+|---|---|
+| `--gres=gpu:1` | 2026-10-03 21:29 — **earliest** |
+| `--gres=gpu:H200:1` | 2026-10-03 21:29 (identical) |
+| `--gres=gpu:A100:1` | 2026-10-03 23:37 (+2h08m) |
+
+A100 is the *contended* card here, so "give the big model the big card" is the
+slowest option available. A multi-type request (`gpu:A100:1,gpu:H200:1`) does
+not parse, so unpinned is the only way to stay flexible — and it is also the
+fastest.
+
+**Flexibility does not cost run quality.** `--mem ≥ 64gb` is what actually
+selects the large nodes, and `TF_FORCE_UNIFIED_MEMORY` with
+`XLA_CLIENT_MEM_FRACTION` 4.0 means a job that does land on a 48 GB card spills
+to host RAM and runs slower rather than failing. The failure mode is degraded
+speed, never a wrong or missing answer.
+
 `gpumem_per_gpu` does **not** influence scheduling here — 40G, 48G and 80G all
 return the same estimate as an unpinned request — so it cannot be used to
-guarantee a large card. Above 4096 tokens the type is pinned explicitly, and
-`--mem` remains the real lever.
+guarantee a large card either. `--mem` remains the real lever.
 
 > **How much of the ladder is measured?** The ≤1536 / 48gb tier encodes Mau's
 > own documented constraint and his measured queue behaviour. The 2048–3072 and

@@ -87,9 +87,28 @@ RESOURCE_LADDER = [
      "any GPU type; 48gb keeps the abundant gpu4 nodes eligible"),
     (3072, "gpu:1", "60gb", "triton", 3.2,
      "any GPU type, still under the 64gb gpu4 cutoff; more host RAM for spill"),
-    (10 ** 9, "gpu:A100:1", "96gb", "xla", 4.0,
-     ">=4096 tokens: pin A100 and take the gpu8 nodes via >=64gb; XLA kernel"),
+    (10 ** 9, "gpu:1", "96gb", "xla", 4.0,
+     ">=4096 tokens: any type; >=64gb reaches the big nodes, XLA kernel + a "
+     "4.0 unified-memory pool covers a smaller card by spilling to host"),
 ]
+
+# The ladder never names a card. Measured on bwHelix at the big-model tier
+# (--mem=96gb, same job):
+#
+#     --gres=gpu:1        start 2026-10-03T21:29   <- earliest
+#     --gres=gpu:H200:1   start 2026-10-03T21:29      (identical)
+#     --gres=gpu:A100:1   start 2026-10-03T23:37      (+2h08m)
+#
+# A100 is the CONTENDED card here, so pinning it -- the intuitive "give the big
+# model the big card" move -- is the slowest option available. A multi-type
+# request (gpu:A100:1,gpu:H200:1) does not parse, so unpinned is the only way
+# to stay flexible, and it happens to be the fastest.
+#
+# Quality is not traded for it. --mem >= 64gb is what actually selects the
+# large nodes (Mau's documented gpu4/gpu8 split), and TF_FORCE_UNIFIED_MEMORY
+# with XLA_CLIENT_MEM_FRACTION 4.0 means a job that does land on a 48 GB card
+# spills to host RAM and runs slower rather than failing. The failure mode is
+# degraded speed, never a wrong or missing answer.
 
 
 def resources_for(bucket: int) -> dict:
