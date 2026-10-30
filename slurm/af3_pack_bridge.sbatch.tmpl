@@ -49,7 +49,9 @@ if [ -f "{OUTDIR}/.af3lis_align_mode" ] && \
         echo "ERROR: merge step failed; nothing to pack" >&2; exit 7; }}
 fi
 
-"$PY" pipeline.py --pack --outdir "{OUTDIR}" --target-hours {TARGET_HOURS}
+# A calibration is used only if it was named at build time (PACK_EXTRA
+# carries `--calib <run dir>/pack_calib.json`); nothing is auto-loaded.
+"$PY" pipeline.py --pack --outdir "{OUTDIR}" --target-hours {TARGET_HOURS}{PACK_EXTRA}
 
 SUBMIT="{OUTDIR}/af3pack/submit_all.sh"
 [ -r "$SUBMIT" ] || {{ echo "ERROR: pack produced no $SUBMIT" >&2; exit 4; }}

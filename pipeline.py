@@ -351,9 +351,18 @@ def render_sbatches(jobs: list[tuple[str, str]],
     rendered_pack = _render_template(TMPL_PACK, infer_map)
     # Bridge runs on the CPU partition (it only groups + sbatches), so it
     # takes the align map plus the pack sizing knob.
+    # A calibration reaches the bridge only by being named at build time
+    # (--calib, validated and copied into the run dir); pack never picks one
+    # up from the run dir by itself.
+    pack_extra = ""
+    if cfg.get("calib"):
+        pack_extra = " --calib " + shlex.quote(str(cfg["calib"]))
+        if cfg.get("force_calib"):
+            pack_extra += " --force-calib"
     bridge_map = dict(align_map,
                       PIPELINE_DIR=os.path.abspath(HERE),
-                      TARGET_HOURS=cfg.get("target_hours", 1.5))
+                      TARGET_HOURS=cfg.get("target_hours", 1.5),
+                      PACK_EXTRA=pack_extra)
     rendered_bridge = _render_template(TMPL_BRIDGE, bridge_map)
     # Final scoring/plot/PDB stage. CPU partition; needs the af3lis conda env,
     # so it resolves AF3LIS_PYTHON via env/activate.sh at run time.
@@ -451,9 +460,12 @@ def write_runbook(outdir: str,
         "python %s/pipeline.py --pack --probe 10 --outdir %s %s\n"
         "bash %s/af3pack_probe/submit_all.sh\n"
         "#     ...when it finishes:\n"
-        "python -m af3lis.calibrate %s/logs/pack_*.out --out %s/calib.json\n"
-        "# (b) size + submit the campaign (uses calib.json if present):\n"
-        "python %s/pipeline.py --pack --outdir %s %s\n"
+        "python -m af3lis.calibrate %s/logs/pack_af3pack_group_*.out "
+        "--out %s/calib.json\n"
+        "# (b) size + submit the campaign (a calibration is used ONLY when\n"
+        "#     named with --calib; it is refused if >2x faster than the\n"
+        "#     built-in table unless --force-calib):\n"
+        "python %s/pipeline.py --pack --outdir %s --calib %s/calib.json %s\n"
         "bash %s/af3pack/submit_all.sh\n"
         "# models land in out_pack/ -> collect with:\n"
         "python %s/pipeline.py --collect %s/out_pack -o %s/metrics.tsv %s\n"
@@ -478,7 +490,7 @@ def write_runbook(outdir: str,
            HERE, abs_out, cfg_arg,          # --pack --probe
            abs_out,                          # bash af3pack_probe/submit_all.sh
            abs_out, abs_out,                 # calibrate log -> calib.json
-           HERE, abs_out, cfg_arg,           # --pack
+           HERE, abs_out, abs_out, cfg_arg,  # --pack --calib
            abs_out,                          # bash af3pack/submit_all.sh
            HERE, abs_out, abs_out, cfg_arg,  # collect out_pack
            HERE, abs_out, cfg_arg)
@@ -832,8 +844,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--safety", type=float, default=1.3,
                     help="with --pack: walltime margin on the estimate")
     ap.add_argument("--calib", default=None,
-                    help="with --pack: calib.json from `python -m af3lis.calibrate` "
-                         "(defaults to <outdir>/calib.json when present)")
+                    help="calib.json from `python -m af3lis.calibrate`. With "
+                         "--pack: size from it. At build time: validated, "
+                         "copied into the run dir and handed to the bridge. "
+                         "Used ONLY when given -- never auto-loaded.")
+    ap.add_argument("--force-calib", action="store_true",
+                    help="use --calib even if it is >2x faster than the "
+                         "built-in conservative table")
     ap.add_argument("--pack-max-jobs", type=int, default=90,
                     help="with --pack: warn above this many jobs (~100 accrue age)")
     ap.add_argument("--pack-copy", action="store_true",
@@ -913,15 +930,18 @@ def main() -> None:
         if not a.outdir:
             ap.error("--pack requires --outdir")
         from af3lis.pack import cmd_pack
-        calib = a.calib
-        if calib is None:
-            default_calib = os.path.join(a.outdir, "calib.json")
-            if os.path.exists(default_calib):
-                calib = default_calib
-                print("[pack] using %s" % default_calib)
+        # No auto-load. A calib.json sitting in the run dir used to be picked
+        # up without --calib, so a forgotten or superseded calibration could
+        # silently size a real campaign.
+        if a.calib is None:
+            stray = os.path.join(a.outdir, "calib.json")
+            if os.path.exists(stray):
+                print("[pack] NOTE: %s exists but is NOT used -- pass "
+                      "--calib %s to size from it" % (stray, stray))
         cmd_pack(a.outdir, target_hours=a.target_hours, safety=a.safety,
-                 calib_path=calib, max_jobs=a.pack_max_jobs,
-                 copy=a.pack_copy, probe=a.probe)
+                 calib_path=a.calib, max_jobs=a.pack_max_jobs,
+                 copy=a.pack_copy, probe=a.probe,
+                 force_calib=a.force_calib)
         return
 
     # ---- submit short-circuit ----
@@ -932,6 +952,11 @@ def main() -> None:
         # it, else read the authoritative modelSeeds from the first JSON in
         # the list file (this is what's actually baked in). CLI default '1'
         # was making every multi-seed run unsubmittable.
+        if a.calib:
+            sys.stderr.write(
+                "[submit] WARNING: --calib is ignored here -- the bridge was "
+                "rendered at build time. Rebuild with --calib, or run "
+                "`--pack --calib` by hand after the align stage.\n")
         listfile = os.path.join(a.outdir, "af3_json_list.txt")
         if a.seeds is _UNSET:
             if os.path.exists(listfile):
@@ -996,10 +1021,30 @@ def main() -> None:
     for f in a.fasta:
         overrides.update(fetch.load_fasta(f))   # --fasta wins over inline TSV
 
+    if a.calib:
+        # Checked NOW, while someone is watching, rather than in the bridge
+        # hours later; then copied into the run dir, so what the bridge reads
+        # travels with the run and cannot be moved or edited out from under it.
+        from af3lis.pack import load_calib
+        _c, _s, _k, cinfo = load_calib(a.calib, force=a.force_calib)
+        if cinfo["status"] not in ("measured", "forced"):
+            ap.error("--calib %s %s:\n  %s%s" % (
+                a.calib, cinfo["status"], "\n  ".join(cinfo["reasons"]),
+                "\n  (--force-calib if a faster GPU genuinely explains it)"
+                if cinfo["status"] == "refused" else ""))
+
     os.makedirs(a.outdir, exist_ok=True)
     os.makedirs(os.path.join(a.outdir, "logs"), exist_ok=True)
     align_mode = a.align_mode or cfg.get("align_mode", "pair")
     cfg = dict(cfg, align_mode=align_mode)
+    if a.calib:
+        import shutil
+        pinned = os.path.abspath(os.path.join(a.outdir, "pack_calib.json"))
+        if os.path.abspath(a.calib) != pinned:
+            shutil.copyfile(a.calib, pinned)
+        cfg = dict(cfg, calib=pinned, force_calib=a.force_calib)
+        print("[build] calibration %s %s -> %s (the bridge packs with it)"
+              % (a.calib, cinfo["status"], pinned))
     os.makedirs(os.path.join(a.outdir, "out"), exist_ok=True)
 
     A = fetch.resolve_chain(a.chainA, a.cache, overrides,

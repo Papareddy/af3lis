@@ -183,16 +183,108 @@ def token_count(input_json: dict) -> int:
     return n
 
 
-def _load_calib(path: str | None) -> tuple[dict[int, float], float, float]:
+# A measured table more than this much faster than the built-in one, in any
+# bucket, is refused unless forced. The built-in table over-asks by up to ~2x
+# where it has been checked, so a genuine calibration stays inside the limit;
+# the one that did not was ~5x too fast from a method error, and would have
+# packed ~2 h of work into a ~30 min walltime.
+CALIB_MAX_SPEEDUP = 2.0
+
+
+def check_calib(table: dict[int, float],
+                max_speedup: float = CALIB_MAX_SPEEDUP) -> list[str]:
+    """Why a measured {bucket: s/condition} table is implausible (empty if
+    it is not): any bucket > max_speedup x faster than the built-in time."""
+    reasons = []
+    for b in sorted(table):
+        ref, v = default_sec(b), float(table[b])
+        if v * max_speedup < ref:
+            reasons.append(
+                f"bucket {b}: {v:.1f} s/condition is {ref / max(v, 1e-9):.1f}x "
+                f"faster than the built-in {ref:.0f} s (limit {max_speedup:g}x)")
+    return reasons
+
+
+def load_calib(path: str | None, force: bool = False
+               ) -> tuple[dict[int, float], float, float, dict]:
+    """(calib, startup, compile_s, info) for a --calib path.
+
+    A calibration is used ONLY when a path is given -- nothing is picked up
+    from the run dir by itself. A path that is missing, unreadable, or
+    implausibly fast (check_calib; overridden by force=True or by a
+    calibration that af3lis.calibrate wrote with --force) falls back to the
+    built-in conservative table, and ``info`` says which and why, so the
+    caller can say so loudly. Falling back rather than crashing matters:
+    pack runs unattended in the bridge job, where a crash strands the whole
+    campaign after alignment, and the built-in table errs on the safe side.
+    """
     calib = {int(k): float(v) for k, v in DEFAULT_CALIB.items()}
     startup, compile_s = DEFAULT_STARTUP, DEFAULT_COMPILE
-    if path:
+    info: dict = {"source": "built-in conservative table", "path": None,
+                  "status": "default", "reasons": []}
+    if not path:
+        return calib, startup, compile_s, info
+    info["path"] = os.path.abspath(path)
+    if not os.path.exists(path):
+        info.update(status="missing", reasons=[f"{path} does not exist"])
+        return calib, startup, compile_s, info
+    try:
         with open(path) as fh:
             c = json.load(fh)
-        startup = float(c.pop("startup", startup))
-        compile_s = float(c.pop("compile", compile_s))
-        calib.update({int(k): float(v) for k, v in c.items()})
-    return calib, startup, compile_s
+        table = {int(k): float(v) for k, v in c.items()
+                 if not str(k).startswith("_") and k not in ("startup", "compile")}
+        st = float(c.get("startup", startup))
+        co = float(c.get("compile", compile_s))
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        info.update(status="unreadable", reasons=[f"{path}: {e}"])
+        return calib, startup, compile_s, info
+    reasons = check_calib(table)
+    if reasons and not (force or c.get("_forced")):
+        info.update(status="refused", reasons=reasons)
+        return calib, startup, compile_s, info
+    calib.update(table)
+    info.update(source=os.path.abspath(path),
+                status="forced" if reasons else "measured",
+                reasons=reasons, buckets=sorted(table))
+    return calib, st, co, info
+
+
+def _report_calib(info: dict, startup: float, compile_s: float) -> None:
+    st = info["status"]
+    if st == "default":
+        print("[pack] calibration: built-in conservative table "
+              "(no --calib given)")
+    elif st in ("measured", "forced"):
+        print(f"[pack] calibration: {info['path']} -- measured bucket(s) "
+              f"{', '.join(map(str, info['buckets']))}, built-in table for "
+              f"the rest; startup {startup:g} s, compile {compile_s:g} s")
+        if st == "forced":
+            sys.stderr.write("[pack] WARNING: this calibration is FORCED past "
+                             "the plausibility check:\n")
+            for r in info["reasons"]:
+                sys.stderr.write(f"[pack]   {r}\n")
+    else:
+        sys.stderr.write(
+            f"[pack] WARNING: calibration {info['path']} {st.upper()} -- "
+            f"sizing from the built-in conservative table instead:\n")
+        for r in info["reasons"]:
+            sys.stderr.write(f"[pack]   {r}\n")
+        if st == "refused":
+            sys.stderr.write("[pack]   (pass --force-calib if a faster GPU "
+                             "genuinely explains it)\n")
+
+
+def _write_calib_used(pack_root: str, calib: dict[int, float],
+                      startup: float, compile_s: float, info: dict) -> None:
+    """Record what actually sized this pack, beside groups.tsv."""
+    os.makedirs(pack_root, exist_ok=True)
+    with open(os.path.join(pack_root, "calib_used.json"), "w") as fh:
+        json.dump({"source": info["source"], "status": info["status"],
+                   "requested": info["path"], "reasons": info["reasons"],
+                   "startup": startup, "compile": compile_s,
+                   "sec_per_condition": {str(b): calib[b]
+                                         for b in sorted(calib)}},
+                  fh, indent=2)
 
 
 def _walltime_str(minutes: int) -> str:
@@ -359,7 +451,8 @@ def cmd_pack(outdir: str,
              calib_path: str | None = None,
              max_jobs: int = 90,
              copy: bool = False,
-             probe: int = 0) -> None:
+             probe: int = 0,
+             force_calib: bool = False) -> None:
     outdir = os.path.abspath(outdir)
     sbatch_path = os.path.join(outdir, "pack_infer.sbatch")
     if not os.path.exists(sbatch_path):
@@ -367,7 +460,8 @@ def cmd_pack(outdir: str,
             f"missing {sbatch_path} -- rebuild the screen with the current "
             f"pipeline.py (it renders pack_infer.sbatch at build time)")
 
-    calib, startup, compile_s = _load_calib(calib_path)
+    calib, startup, compile_s, cinfo = load_calib(calib_path, force=force_calib)
+    _report_calib(cinfo, startup, compile_s)
     records, missing = scan_run_dir(outdir)
     if missing:
         mfile = os.path.join(outdir, "af3pack_missing.txt")
@@ -390,10 +484,12 @@ def cmd_pack(outdir: str,
         groups = build_groups(recs, pack_root, target_hours, safety,
                               calib, startup, compile_s, copy=copy)
         sub = write_submit(groups, pack_root, sbatch_path, out_pack, max_jobs)
+        _write_calib_used(pack_root, calib, startup, compile_s, cinfo)
         print(f"probe: {len(recs)} conditions @ bucket {modal} -> {sub}")
         print(f"after it finishes:  python -m af3lis.calibrate "
-              f"{outdir}/logs/pack_*.out --out {outdir}/calib.json")
-        print(f"then re-pack with:  --calib {outdir}/calib.json")
+              f"{outdir}/logs/pack_af3pack_group_*.out --out {outdir}/calib.json")
+        print(f"then re-pack with:  --calib {outdir}/calib.json   "
+              f"(it is never picked up without the flag)")
         return
 
     pack_root = os.path.join(outdir, "af3pack")
@@ -401,6 +497,7 @@ def cmd_pack(outdir: str,
     groups = build_groups(records, pack_root, target_hours, safety,
                           calib, startup, compile_s, copy=copy)
     sub = write_submit(groups, pack_root, sbatch_path, out_pack, max_jobs)
+    _write_calib_used(pack_root, calib, startup, compile_s, cinfo)
 
     nseeds = Counter(r["nseeds"] for r in records).most_common(1)[0][0]
     print(f"{len(records)} conditions, {nseeds} seed(s) -> {len(groups)} packed "
@@ -409,10 +506,10 @@ def cmd_pack(outdir: str,
     for g in groups:
         print(f"{os.path.basename(g['dir']):>16} {g['bucket']:>6} "
               f"{len(g['members']):>6} {g['est_s'] / 60:>8.1f} {g['walltime']:>9}")
-    if not calib_path:
-        print("\nNOTE: sized from the DEFAULT calibration (only buckets 512/768 "
-              "measured, A100). For a new size class or GPU, run --probe first "
-              "and re-pack with --calib.")
+    if cinfo["status"] not in ("measured", "forced"):
+        print("\nNOTE: sized from the built-in conservative table (see "
+              "af3pack/calib_used.json). For a new size class or GPU, run "
+              "--probe first and re-pack with --calib.")
     print(f"\nsubmit: bash {sub}   "
           f"(models -> {out_pack}; collect with --collect {out_pack})")
 
@@ -425,7 +522,11 @@ def main() -> None:
     ap.add_argument("--safety", type=float, default=1.3,
                     help="walltime margin on the estimate (default 1.3)")
     ap.add_argument("--calib", default=None,
-                    help="calib.json from af3lis.calibrate (per-bucket seconds)")
+                    help="calib.json from af3lis.calibrate (per-bucket seconds). "
+                         "Used only when given; nothing is auto-loaded.")
+    ap.add_argument("--force-calib", action="store_true",
+                    help="use --calib even if it is >2x faster than the "
+                         "built-in table")
     ap.add_argument("--max-jobs", type=int, default=90,
                     help="warn above this many jobs (age-accrue window ~100)")
     ap.add_argument("--copy", action="store_true",
@@ -436,7 +537,7 @@ def main() -> None:
     a = ap.parse_args()
     cmd_pack(a.outdir, target_hours=a.target_hours, safety=a.safety,
              calib_path=a.calib, max_jobs=a.max_jobs, copy=a.copy,
-             probe=a.probe)
+             probe=a.probe, force_calib=a.force_calib)
 
 
 if __name__ == "__main__":

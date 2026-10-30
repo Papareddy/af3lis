@@ -128,27 +128,259 @@ def test_build_groups_single_bucket_and_walltime():
         assert all(len(g["walltime"]) == 8 for g in groups)
 
 
-def test_calibrate_median_and_startup():
-    log = (
-        "I0825 10:00:00.000000 start\n"
-        "I0825 10:00:01.500000 Calculating bucket size for input with 500 tokens.\n"
-        "I0825 10:00:02.000000 Got bucket size 512 for input with 500 tokens.\n"
-        "I0825 10:01:10.000000 Calculating bucket size for input with 490 tokens.\n"
-        "I0825 10:01:10.500000 Got bucket size 512 for input with 490 tokens.\n"
-        "I0825 10:01:44.000000 Calculating bucket size for input with 505 tokens.\n"
-        "I0825 10:01:44.200000 Got bucket size 512 for input with 505 tokens.\n"
-    )
-    with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as fh:
-        fh.write(log)
-        path = fh.name
+def _hms(t: float) -> str:
+    t %= 86400.0
+    return "%02d:%02d:%09.6f" % (t // 3600, (t % 3600) // 60, t % 60)
+
+
+def _absl_log(n_cond, nseeds, per_seed, bucket=512, tokens0=480, t0=36000.0,
+              startup=30.0, compile_extra=60.0, feat_gap=4.0,
+              seed_print=True, durations=None):
+    """Synthetic packed-job log shaped like AF3 3.0.1's: every seed of a
+    condition is featurised up front (one bucket-line pair per seed, a few
+    seconds apart), then inference runs; the first condition also pays the
+    XLA compile."""
+    out = [f"I1020 {_hms(t0)} 1 run_alphafold.py] job start\n"]
+    t = t0 + startup
+    seeds = ", ".join(str(i + 1) for i in range(nseeds))
+    for i in range(n_cond):
+        tok = tokens0 + i                       # neighbours differ in size
+        if seed_print:
+            out.append(f"Featurising data for seeds ({seeds}{',' if nseeds == 1 else ''})...\n")
+        for k in range(nseeds):
+            ts = t + k * feat_gap
+            out.append(f"I1020 {_hms(ts)} 1 pipeline.py:257] Calculating bucket "
+                       f"size for input with {tok} tokens.\n")
+            out.append(f"I1020 {_hms(ts + 0.3)} 1 pipeline.py:263] Got bucket "
+                       f"size {bucket} for input with {tok} tokens, resulting in "
+                       f"{bucket - tok} padded tokens.\n")
+        dur = (durations[i] if durations else per_seed) * nseeds
+        t += dur + (compile_extra if i == 0 else 0.0)
+    return "".join(out)
+
+
+def _write(text, suffix=".out"):
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    return path
+
+
+def test_calibrate_single_seed_conditions():
+    """One seed: each condition's gap is the whole cycle. The first
+    condition carries the compile and the last has no end, so 6 conditions
+    give 4 measurements."""
+    p = _write(_absl_log(6, 1, per_seed=90.0))
+    out = calibrate(p)
+    assert abs(out["512"] - 90.0) < 0.2, out
+    assert out["_meta"]["n_per_bucket"]["512"] == 4
+    assert out["_meta"]["excluded_compile"] == 1
+    assert abs(out["startup"] - 30.0) < 0.01
+    assert out["compile"] == 40.0
+
+
+def test_calibrate_multiseed_is_not_featurisation_time():
+    """Regression for the ~5x-too-fast calibration. With several seeds AF3
+    logs one bucket line per seed back to back (featurisation), so most gaps
+    between successive bucket lines are seconds long. Taking the median of
+    those -- the old method -- returns featurisation time, not condition
+    time. The per-seed condition time here is 100 s."""
+    for seed_print in (True, False):            # print present / GCD fallback
+        p = _write(_absl_log(7, 5, per_seed=100.0, bucket=1024, tokens0=900,
+                             seed_print=seed_print))
+        out = calibrate(p)
+        assert abs(out["1024"] - 100.0) < 0.5, (seed_print, out)
+        assert out["_meta"]["seeds"][os.path.basename(p)].startswith("5 ")
+        # what the old gap-between-any-two-lines median would have said
+        from af3lis.calibrate import parse_log
+        import statistics
+        ts = [x[0] for x in parse_log(p)["lines"]]
+        old = statistics.median(b - a for a, b in zip(ts, ts[1:]))
+        assert old < 10.0, old                  # featurisation, ~25x too fast
+
+
+def test_calibrate_logs_are_independent_and_small_buckets_dropped():
+    """Each log is parsed on its own (no gap spans two jobs, even when the
+    second job's clock reads EARLIER), and a bucket measured on fewer than
+    --min-per-bucket conditions is dropped rather than trusted."""
+    a = _write(_absl_log(4, 1, per_seed=150.0, bucket=1024, t0=80000.0))
+    b = _write(_absl_log(5, 1, per_seed=150.0, bucket=1024, t0=3600.0))
+    bridge = _write("[pack] 12 conditions -> 2 packed jobs\nno timestamps\n")
+    alone = calibrate(a)
+    assert "1024" not in alone, alone           # 2 measured < 3
+    assert "1024" in alone["_meta"]["dropped_buckets"]
+    both = calibrate([a, b, bridge])
+    assert abs(both["1024"] - 150.0) < 0.2, both
+    assert both["_meta"]["n_per_bucket"]["1024"] == 5
+    assert both["_meta"]["logs_without_bucket_lines"] == 1
+
+
+def test_calibrate_drops_implausibly_fast_conditions():
+    """A condition that 'finishes' in seconds was skipped or failed; it must
+    not pull the median down."""
+    durs = [90.0, 90.0, 2.0, 90.0, 90.0, 90.0, 90.0]
+    p = _write(_absl_log(7, 1, per_seed=90.0, durations=durs))
+    out = calibrate(p)
+    assert out["_meta"]["excluded_fast"] == 1
+    assert abs(out["512"] - 90.0) < 0.2, out
+
+
+def test_check_calib_refuses_the_too_fast_calibration():
+    from af3lis.pack import check_calib
+    # the values that nearly sized a real campaign
+    bad = check_calib({1024: 17.6, 1280: 78.2})
+    assert len(bad) == 2, bad
+    # what that campaign's own probe measured: inside the 2x limit
+    assert check_calib({1024: 87.0, 1280: 140.0}) == []
+
+
+def test_calibrate_cli_refuses_unless_forced():
+    import json
+    from af3lis import calibrate as cal
+    from af3lis.pack import load_calib
+    log = _write(_absl_log(6, 1, per_seed=20.0, bucket=1024, tokens0=900))
+    out = os.path.join(tempfile.mkdtemp(), "calib.json")
     try:
-        out = calibrate(path)
-        # gaps attributed to the PREVIOUS condition's bucket: 68.5, 34.0
-        assert out["512"] == 51.2 or abs(out["512"] - 51.2) < 0.2  # median of 2
-        assert abs(out["startup"] - 1.5) < 0.01
-        assert out["compile"] == 40.0
-    finally:
-        os.unlink(path)
+        cal.main([log, "--out", out])
+        raise AssertionError("an 8x-too-fast calibration was accepted")
+    except SystemExit as e:
+        assert e.code == 2, e.code
+    assert not os.path.exists(out), "refused calibration was written"
+    rej = json.load(open(out + ".rejected"))
+    assert rej["_rejected"] and "1024" in rej["_rejected"][0]
+
+    cal.main([log, "--out", out, "--force"])
+    c = json.load(open(out))
+    assert c["_forced"], c
+    # the recorded --force is honoured downstream without a second flag
+    calib, _, _, info = load_calib(out)
+    assert info["status"] == "forced" and calib[1024] == c["1024"], info
+
+
+def test_load_calib_never_crashes_and_falls_back_safely():
+    import json
+    from af3lis.pack import DEFAULT_CALIB, load_calib
+    d = tempfile.mkdtemp()
+    # missing path: was an unguarded open() -> crash in the bridge
+    calib, st, co, info = load_calib(os.path.join(d, "gone.json"))
+    assert info["status"] == "missing"
+    assert calib == {k: float(v) for k, v in DEFAULT_CALIB.items()}
+    # unreadable
+    bad = os.path.join(d, "bad.json")
+    open(bad, "w").write("{not json")
+    assert load_calib(bad)[3]["status"] == "unreadable"
+    # refused -> built-in table, unless forced
+    fast = os.path.join(d, "fast.json")
+    json.dump({"1024": 17.6, "startup": 5, "compile": 1,
+               "_meta": {"anything": 1}}, open(fast, "w"))
+    calib, st, co, info = load_calib(fast)
+    assert info["status"] == "refused" and calib[1024] == DEFAULT_CALIB[1024]
+    assert st != 5, "a refused file's startup leaked through"
+    calib, st, co, info = load_calib(fast, force=True)
+    assert info["status"] == "forced" and calib[1024] == 17.6 and st == 5
+    # plausible -> used, with _meta ignored
+    good = os.path.join(d, "good.json")
+    json.dump({"1024": 120.0, "_meta": {"x": 1}}, open(good, "w"))
+    calib, _, _, info = load_calib(good)
+    assert info["status"] == "measured" and calib[1024] == 120.0
+    assert calib[512] == DEFAULT_CALIB[512]       # untouched buckets kept
+
+
+def _mini_run_dir():
+    """A packable run dir: one ~1000-token pair with its align output."""
+    import json
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, "jsons"))
+    pj = {"name": "bait___preyA", "modelSeeds": [1],
+          "sequences": [{"protein": {"id": "A", "sequence": "M" * 600}},
+                        {"protein": {"id": "B", "sequence": "K" * 400}}]}
+    json.dump(pj, open(os.path.join(d, "jsons", "bait___preyA.json"), "w"))
+    od = os.path.join(d, "out", "bait___preya")
+    os.makedirs(od)
+    json.dump(pj, open(os.path.join(od, "bait___preya_data.json"), "w"))
+    open(os.path.join(d, "pack_infer.sbatch"), "w").write("#!/bin/bash\n")
+    cfg = os.path.join(d, "empty_config.yaml")
+    open(cfg, "w").write("")
+    return d, cfg
+
+
+def _pipeline(*args):
+    import subprocess
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return subprocess.run([sys.executable, os.path.join(here, "pipeline.py"),
+                           *args], capture_output=True, text=True)
+
+
+def test_pack_never_autoloads_a_run_dir_calibration():
+    """A calib.json in the run dir used to size the campaign without
+    --calib. Now it is reported and ignored; an explicit one that is
+    missing or implausible falls back to the built-in table without a
+    traceback, and calib_used.json records what sized the pack."""
+    import json
+    from af3lis.pack import DEFAULT_CALIB
+    d, cfg = _mini_run_dir()
+    json.dump({"1024": 5.0}, open(os.path.join(d, "calib.json"), "w"))
+    used = os.path.join(d, "af3pack", "calib_used.json")
+
+    r = _pipeline("--config", cfg, "--pack", "--outdir", d)
+    assert r.returncode == 0, r.stderr
+    assert "is NOT used" in r.stdout, r.stdout
+    u = json.load(open(used))
+    assert u["status"] == "default", u
+    assert u["sec_per_condition"]["1024"] == DEFAULT_CALIB[1024]
+
+    r = _pipeline("--config", cfg, "--pack", "--outdir", d,
+                  "--calib", os.path.join(d, "calib.json"))
+    assert r.returncode == 0, r.stderr
+    assert "REFUSED" in r.stderr, r.stderr
+    assert json.load(open(used))["status"] == "refused"
+
+    r = _pipeline("--config", cfg, "--pack", "--outdir", d,
+                  "--calib", os.path.join(d, "gone.json"))
+    assert r.returncode == 0 and "Traceback" not in r.stderr, r.stderr
+    assert "MISSING" in r.stderr, r.stderr
+    assert json.load(open(used))["status"] == "missing"
+
+
+def test_build_validates_pins_and_hands_calibration_to_the_bridge():
+    """--calib at build time used to be accepted and ignored. It is now
+    checked while someone is watching, copied into the run dir, and rendered
+    into the bridge's --pack line; a bad one stops the build."""
+    import json
+    d = tempfile.mkdtemp()
+    cfg = os.path.join(d, "c.yaml")
+    open(cfg, "w").write("")
+    good = os.path.join(d, "good.json")
+    json.dump({"1024": 120.0}, open(good, "w"))
+    run = os.path.join(d, "run")
+    base = ["--config", cfg, "--name", "t", "--outdir", run,
+            "--chainA", "bait=" + "M" * 30, "--chainB", "preyA=" + "K" * 30,
+            "--cache", os.path.join(d, "cache")]
+    r = _pipeline(*base, "--calib", good)
+    assert r.returncode == 0, r.stderr
+    pinned = os.path.join(run, "pack_calib.json")
+    assert json.load(open(pinned)) == {"1024": 120.0}
+
+    def pack_line():
+        txt = open(os.path.join(run, "pack_bridge.sbatch")).read()
+        line, = [l for l in txt.splitlines()
+                 if l.startswith('"$PY" pipeline.py --pack')]
+        return line
+    assert "--calib " in pack_line() and pinned in pack_line(), pack_line()
+    # without --calib the bridge carries none
+    r = _pipeline(*base, "--rebuild")
+    assert r.returncode == 0, r.stderr
+    assert "--calib" not in pack_line(), pack_line()
+    # refused / missing stop the build
+    fast = os.path.join(d, "fast.json")
+    json.dump({"1024": 17.6}, open(fast, "w"))
+    r = _pipeline(*base, "--rebuild", "--calib", fast)
+    assert r.returncode == 2 and "refused" in r.stderr, r.stderr
+    r = _pipeline(*base, "--rebuild", "--calib", fast, "--force-calib")
+    assert r.returncode == 0, r.stderr
+    assert pack_line().endswith("--force-calib"), pack_line()
+    r = _pipeline(*base, "--rebuild", "--calib", os.path.join(d, "gone.json"))
+    assert r.returncode == 2 and "missing" in r.stderr, r.stderr
 
 
 def test_parse_ipsae_txt_max_rows_only():

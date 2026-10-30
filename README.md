@@ -295,13 +295,59 @@ The 3584 point is why the large buckets went **up**: AF3 ran that complex in
 bucket 3584, which this ladder did not have, so it was sized as a 4096 at
 3000 s, killed at 1:10, and finished in 1:28 when resubmitted with 4 h. A table
 that gives a 4096 less time than a measured 3584 needed is not conservative.
-For a new size class or a different GPU, measure first:
+For a new size class or a different GPU, measure first. A probe needs MSAs,
+so align, probe one group, then size the campaign from what it measured:
 
 ```bash
-bash af3lis.sh run --chains-tsv chains.tsv --name Probe --probe 10   # one short GPU job
-python -m af3lis.calibrate runs/Probe/logs/pack_*.out --out runs/Probe/calib.json
-bash af3lis.sh run --chains-tsv chains.tsv --name Real --calib runs/Probe/calib.json
+python pipeline.py --config config.yaml --chains-tsv chains.tsv --name Real --outdir runs/Real
+python pipeline.py --config config.yaml --submit --align-only --outdir runs/Real
+# align finished (monomer mode: python -m af3lis.monomer merge runs/Real first)
+python pipeline.py --pack --probe 10 --outdir runs/Real       # one group, modal bucket
+bash runs/Real/af3pack_probe/submit_all.sh
+# probe finished
+python -m af3lis.calibrate runs/Real/logs/pack_af3pack_group_*.out --out runs/Real/calib.json
+python pipeline.py --pack --outdir runs/Real --calib runs/Real/calib.json
+bash runs/Real/af3pack/submit_all.sh                          # then: af3lis.sh report Real
 ```
+
+A calibration measured on an earlier run (same GPU, same size class) goes in
+at build time and the whole chain uses it:
+`bash af3lis.sh run --chains-tsv chains.tsv --name Real --calib runs/Earlier/calib.json`.
+It is checked there and then, copied into the run dir as `pack_calib.json`,
+and handed to the bridge's `--pack`.
+
+**How a calibration is used — and when it is not.**
+
+* **Only when named.** `--pack` never picks up a calibration by itself. A
+  `calib.json` lying in the run dir is reported (`exists but is NOT used`) and
+  ignored. It used to be loaded automatically, which is how a bad calibration
+  nearly sized a real campaign without anyone passing it.
+* **Measured per condition, seed-aware.** AF3 featurises every seed of a
+  condition up front and logs one bucket line per seed, seconds apart, before
+  the long inference. `af3lis.calibrate` groups those bursts into conditions
+  and divides by the seed count. The old method timed the gap between any two
+  bucket lines, so with five seeds four of every five "conditions" were
+  featurisation only — it came out ~5× too fast (1024 → 17.6 s, 1280 → 78.2 s
+  against ~87 s and ~140 s measured), which would have packed ~2 h of work
+  into a ~30 min walltime.
+* **Guarded.** Each log is parsed on its own (pass as many as you like), the
+  first condition of each bucket in each log is skipped because it carries the
+  XLA compile, a condition faster than 10 s per seed is skipped as a failed or
+  skipped input, and a bucket measured on fewer than 3 conditions is dropped
+  and keeps its built-in time. So a probe needs **≥ 5 conditions** per bucket.
+  All of it is recorded under `_meta` in the output.
+* **Refused when implausible.** A calibration more than **2× faster** than the
+  built-in table in any bucket is refused: `calibrate` writes it to
+  `calib.json.rejected` with the reason, and `--pack` sizes from the built-in
+  table instead, saying so loudly. If a faster GPU genuinely explains it,
+  `calibrate --force` writes it with the reason recorded under `_forced`, which
+  `--pack` honours (or pass `--force-calib`).
+* **Never a crash.** A `--calib` that is missing or unreadable stops a build
+  immediately, while someone is watching. In the bridge, hours later, it falls
+  back to the built-in table with a warning instead of stranding the campaign
+  after alignment — the built-in table errs on the safe side.
+* **Auditable.** Every pack writes `af3pack/calib_used.json`: the table that
+  actually sized it, where it came from, and why anything was refused.
 
 ---
 
@@ -531,7 +577,8 @@ pytest tests/test_metrics.py    # metric parsing
 | `--pack` | implied by `--submit` | build packed groups from finished MSAs. |
 | `--target-hours H` | `1.5` | aim each GPU job near this walltime. |
 | `--safety F` | `1.3` | walltime margin on the estimate. |
-| `--calib F` | `<outdir>/calib.json` if present | measured per-bucket seconds from `af3lis.calibrate`. |
+| `--calib F` | — (built-in table) | measured per-bucket seconds from `af3lis.calibrate`. **Used only when given**; at build time it is validated, copied to `pack_calib.json` and handed to the bridge. |
+| `--force-calib` | off | use `--calib` even if it is > 2× faster than the built-in table. |
 | `--probe N` | `0` | build ONE isolated calibration group of `N` conditions, output to `probe_out/`. |
 | `--pack-max-jobs N` | `90` | warn above this many jobs (≈ the 100-job accrual window). |
 | `--pack-copy` | off | copy data JSONs into groups instead of symlinking. Symlinks are the default because MSA-laden JSONs are large. |
