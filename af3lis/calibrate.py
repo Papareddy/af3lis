@@ -16,9 +16,9 @@ get the per-seed figure ``af3lis.pack`` multiplies back up.
 The original method took the gap between ANY two successive bucket lines.
 That is right for one seed and badly wrong for several: with 5 seeds, four of
 every five gaps are featurisation only, so the median lands on featurisation
-time. That is how a calibration came out ~5x too fast (1024 -> 17.6 s and
-1280 -> 78.2 s per condition, against ~87 s and ~140 s measured) and would
-have sized a real campaign to die at its walltime.
+time -- the most likely reason a calibration came out ~5x too fast (1024 ->
+17.6 s and 1280 -> 78.2 s per condition, against ~87 s and ~140 s measured),
+which would have sized a real campaign to die at its walltime.
 
 Guards, each recorded in the output's ``_meta``:
   * every log is parsed on its own -- no gap ever spans two jobs;

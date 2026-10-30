@@ -46,6 +46,7 @@ sequences pasted into the input file — mixed freely in one run.
 - [Reading the metrics](#reading-the-metrics)
 - [Metrics — provenance](#metrics--provenance)
 - [Traps that cost real time](#traps-that-cost-real-time)
+- [Changelog and known issues](#changelog-and-known-issues)
 - [Credits & citation](#credits--citation)
 
 ---
@@ -327,9 +328,9 @@ and handed to the bridge's `--pack`.
   the long inference. `af3lis.calibrate` groups those bursts into conditions
   and divides by the seed count. The old method timed the gap between any two
   bucket lines, so with five seeds four of every five "conditions" were
-  featurisation only — it came out ~5× too fast (1024 → 17.6 s, 1280 → 78.2 s
-  against ~87 s and ~140 s measured), which would have packed ~2 h of work
-  into a ~30 min walltime.
+  featurisation only. That is the most likely reason a calibration came out
+  ~5× too fast (1024 → 17.6 s, 1280 → 78.2 s against ~87 s and ~140 s
+  measured), which would have packed ~2 h of work into a ~30 min walltime.
 * **Guarded.** Each log is parsed on its own (pass as many as you like), the
   first condition of each bucket in each log is skipped because it carries the
   XLA compile, a condition faster than 10 s per seed is skipped as a failed or
@@ -518,9 +519,10 @@ real walltime calibration for large buckets.
 The offline test suite runs anywhere in seconds:
 
 ```bash
-python tests/test_pack.py       # 9 tests: bucketing, walltime maths, resource
-                                # ladder, submit-script contents, TSV parsing
-pytest tests/test_metrics.py    # metric parsing
+python -m pytest tests/ -q      # everything (pytest ships in env/af3lis.yml)
+python tests/test_pack.py       # bucketing, walltime maths, calibration, resource
+                                # ladder, monomer merge, submit script -- no pytest
+python tests/test_config.py     # config keys -- no pytest
 ```
 
 ---
@@ -818,7 +820,9 @@ slurm/
   af3_infer.sbatch.tmpl         stage 3, legacy per-task array
   af3_analyse.sbatch.tmpl       stage 4, scoring + figures + PDB
 tests/
-  test_pack.py                  bucketing, walltime maths, resource ladder, submit script
+  test_pack.py                  bucketing, walltime maths, calibration, resource ladder,
+                                monomer merge, submit script
+  test_config.py                config keys: aliases, unknown-key warnings, defaults
   test_metrics.py               metric parsing (needs pytest)
 ```
 ## Notes
@@ -840,6 +844,36 @@ tests/
   never exceed 26 and the cap simplifies downstream chain-ID arithmetic.
 - `pTM < 0.05` floor for systems with <20 tokens -- don't use pTM/ipTM as a confidence
   filter for tiny complexes; PEAK/iLIS remain meaningful. `af3lis plot` warns on stderr.
+
+---
+
+## Changelog and known issues
+
+### 2026-10 — four fixes from a ~400-pair monomer-mode screen
+
+Each of these bit a real campaign, and the first three **affect runs made
+before the fix**, so check yours against the middle column.
+
+| what was wrong | what it did to earlier runs | now |
+|---|---|---|
+| Config keys `infer_gpu_gres`, `align_extra`, `infer_extra` were never read — the code reads `gpu_gres`, `af3_data_extra`, `af3_infer_extra` — and unknown keys were stored silently. | The fallback `#SBATCH --gres` was always the built-in `gpu:A100:1`, and extra align/infer flags set in a config never reached AF3. Packed groups were unaffected: they override `--gres` per bucket. | Legacy names are aliases with a deprecation note, every unread key is warned, and the default is `gpu:1`. See [Configuration](#configuration). |
+| Calibration timed the gap between any two bucket lines, and `--pack` loaded `<outdir>/calib.json` without `--calib`. | A multi-seed calibration came out several-fold too fast, and any run dir holding a `calib.json` was sized from it. A missing `--calib` file crashed the bridge. | Per-condition, seed-aware timing; used only when named; > 2× faster than the built-in table refused; `calib_used.json` records what sized each pack. See [Walltime sizing](#walltime-sizing-and-why-you-should-calibrate). |
+| The monomer merge looked chains up by label, while alignment deduplicates by sequence. | Pairs whose label shared a sequence with another — a homodimer, a duplicated isoform — were reported `MISSING`. Two different sequences whose labels sanitise to the same name had the second folded on the first one's MSA. | Chains resolve via their sequence and the MSA's query is checked. Old run dirs re-merge without a rebuild: `python -m af3lis.monomer merge <outdir>`. |
+| The bucket ladder lacked AF3's 2560, 3584 and 4608. | Inputs in those buckets were sized as the next bucket up. Harmless where that over-asks, but the old 4096 and 5120 times were below what a 3584 input measured, so large inputs could hit their walltime. | AF3 3.0.1's ladder verbatim, and the large-bucket times re-anchored on a measured 3584 condition. |
+
+### Known issues
+
+* **`af3lis.sh run` hands extra options to the build step only**, so the
+  pack-stage options `--target-hours`, `--safety`, `--probe`,
+  `--pack-max-jobs` and `--pack-copy` are accepted there and do nothing.
+  `--calib` is the exception (it is rendered into the bridge). Set
+  `target_hours` in `config.yaml`, which the bridge does read, or pack by hand
+  as in [Walltime sizing](#walltime-sizing-and-why-you-should-calibrate).
+* **The ≥ 3584-token times rest on one measured condition.** They are
+  deliberately generous; calibrate before a campaign dominated by large
+  complexes.
+* **The last condition in each log is never timed** — it has no successor to
+  measure against — so a probe needs at least 5 conditions per bucket.
 
 ---
 
