@@ -28,8 +28,10 @@ way: pair chain -> its sequence -> the monomer input emitted for that
 sequence -> that input's MSA. Looking chains up by label instead loses every
 label that shares a sequence with another one -- a deliberate homodimer, a
 duplicated isoform, two accessions for one protein -- because only the first
-label of each sequence was ever aligned. `monomers/*.json` is the index: it
-records exactly what was aligned, and run dirs built before this fix have it
+label of each sequence was ever aligned. `af3_monomer_list.txt` is the
+index: it lists exactly the monomer inputs this build's align array covered
+(`monomers/` itself can still hold inputs from an earlier build, because
+`--rebuild` does not clear it). Run dirs built before this fix have the list
 too, so they can be re-merged without a rebuild.
 """
 from __future__ import annotations
@@ -168,12 +170,40 @@ def _msa_query(path: str, cache: dict[str, str | None]) -> str | None:
     return seq
 
 
-def monomer_index(outdir: str) -> dict[str, str] | None:
-    """sequence -> monomer label, read from the inputs that were aligned.
+def _aligned_monomers(outdir: str) -> list[str]:
+    """The monomer inputs THIS build's align array covered.
 
-    None when there is no `monomers/` dir (not a monomer-mode run).
+    `af3_monomer_list.txt` is the source of truth: `--rebuild` rewrites it but
+    leaves earlier files in `monomers/`, so a stale input from a previous
+    build -- same sequence, an older label -- would otherwise be indexed and
+    could win over the label that was actually aligned. Entries are resolved
+    by basename under `monomers/`, because the list holds absolute paths from
+    wherever the build ran and a run dir is usually synced elsewhere before
+    align. The `monomers/*.json` glob is the fallback for a run dir with no
+    list.
     """
-    files = sorted(glob.glob(os.path.join(outdir, "monomers", "*.json")))
+    mdir = os.path.join(outdir, "monomers")
+    lf = os.path.join(outdir, "af3_monomer_list.txt")
+    if os.path.exists(lf):
+        with open(lf) as fh:
+            names = [os.path.basename(x.strip()) for x in fh if x.strip()]
+        files = [os.path.join(mdir, n) for n in names]
+        gone = [n for n, f in zip(names, files) if not os.path.exists(f)]
+        if gone:
+            print(f"[monomer] WARNING: {len(gone)} input(s) in {lf} are not "
+                  f"under monomers/ (e.g. {gone[0]}) -- their chains will be "
+                  f"MISSING", file=sys.stderr)
+        return [f for f in files if os.path.exists(f)]
+    return sorted(glob.glob(os.path.join(mdir, "*.json")))
+
+
+def monomer_index(outdir: str) -> dict[str, str] | None:
+    """sequence -> monomer label, read from the inputs that were aligned
+    (see _aligned_monomers).
+
+    None when there is no `monomers/` input at all (not a monomer-mode run).
+    """
+    files = _aligned_monomers(outdir)
     if not files:
         return None
     idx: dict[str, str] = {}
@@ -199,22 +229,36 @@ def resolve_msa(msa_root: str, label: str, seq: str,
     sequence. That last check matters on a rebuilt run dir, where a stale
     msa/<label>/ from an earlier sequence can sit beside AF3's timestamped
     sibling holding the new one.
+
+    If that route finds nothing, the chain's OWN label is tried as well, but
+    only an MSA whose query provably is this sequence is accepted there. That
+    keeps the old label lookup's one virtue -- an index pointing at a label
+    that was never aligned cannot hide an MSA sitting under the chain's own
+    name -- without its fault of trusting a name.
     """
     mlab = index.get(seq) if index is not None else label
+    why = None
     if mlab is None:
-        return None, (f"{label}: its sequence was never emitted as a monomer "
-                      f"input (rebuild with --align-mode monomer)")
-    cands = _msa_candidates(msa_root, mlab)
-    if not cands:
-        via = "" if mlab == label else f" (shares its sequence with {mlab})"
-        return None, f"{label}: no MSA under msa/{mlab}/{via}"
-    for c in cands:
-        q = _msa_query(c, cache)
-        if q is None or q == seq:
-            # q None = unreadable query; let the merge script decide
-            return c, ""
-    return None, (f"{label}: msa/{mlab}/ holds an MSA built for a different "
-                  f"sequence (stale align output from an earlier build?)")
+        why = (f"{label}: its sequence was never emitted as a monomer input "
+               f"(rebuild with --align-mode monomer)")
+    else:
+        cands = _msa_candidates(msa_root, mlab)
+        for c in cands:
+            q = _msa_query(c, cache)
+            if q is None or q == seq:
+                # q None = unreadable query; let the merge script decide
+                return c, ""
+        if not cands:
+            via = "" if mlab == label else f" (shares its sequence with {mlab})"
+            why = f"{label}: no MSA under msa/{mlab}/{via}"
+        else:
+            why = (f"{label}: msa/{mlab}/ holds an MSA built for a different "
+                   f"sequence (stale align output from an earlier build?)")
+    if mlab != label:
+        for c in _msa_candidates(msa_root, label):
+            if _msa_query(c, cache) == seq:
+                return c, ""
+    return None, why
 
 
 def merge_all(outdir: str, seeds: list[int] | None = None,

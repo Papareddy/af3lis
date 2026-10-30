@@ -693,6 +693,68 @@ def test_monomer_merge_skips_stale_msa_for_a_changed_sequence():
     assert n == 0 and missing == ["bait___preyA"], (n, missing)
 
 
+def test_monomer_merge_ignores_inputs_left_by_an_earlier_build():
+    """--rebuild rewrites af3_monomer_list.txt but leaves monomers/ alone.
+    A stale input from the earlier build -- same sequence, an older label
+    that sorts first -- must not become the label the merge looks for, or a
+    pair whose MSA is on disk is reported MISSING. The list also holds
+    absolute paths from wherever the build ran, so it must still resolve
+    after the run dir has moved."""
+    import shutil, sys, tempfile
+    from af3lis import monomer
+    root = tempfile.mkdtemp()
+    d = os.path.join(root, "built_here")
+    bait, prey = "MKVLSPADKTNVKAAW", "MSEQLTNAVLDAGHLR"
+    _pair_jsons(d, [(("bait", bait), ("aaa_old", prey))])
+    monomer.write_monomers(d, [1])
+    shutil.rmtree(os.path.join(d, "jsons"))
+    _pair_jsons(d, [(("bait", bait), ("preyA", prey))])   # the rebuild
+    monomer.write_monomers(d, [1])
+    assert sorted(os.listdir(os.path.join(d, "monomers"))) == \
+        ["aaa_old.json", "bait.json", "preya.json"]
+    _fake_align(d, labels={"bait", "preya"})              # what was aligned
+    moved = os.path.join(root, "synced_elsewhere")
+    shutil.move(d, moved)
+
+    n, missing = monomer.merge_all(moved, [1], python_exe=sys.executable)
+    assert n == 1 and not missing, (n, missing)
+    _assert_each_chain_got_its_own_msa(moved)
+
+    # no list at all (glob fallback picks the stale label first): the
+    # chain's own label still finds its MSA, because its query matches
+    os.remove(os.path.join(moved, "af3_monomer_list.txt"))
+    shutil.rmtree(os.path.join(moved, "out"))
+    assert monomer.monomer_index(moved)[prey] == "aaa_old"
+    n, missing = monomer.merge_all(moved, [1], python_exe=sys.executable)
+    assert n == 1 and not missing, (n, missing)
+    _assert_each_chain_got_its_own_msa(moved)
+
+
+def test_monomer_label_fallback_never_trusts_a_name():
+    """The own-label fallback accepts only an MSA whose query IS the chain's
+    sequence: an msa/<label>/ built for something else stays MISSING."""
+    import json, shutil, sys, tempfile
+    from af3lis import monomer
+    d = tempfile.mkdtemp()
+    bait, prey, other = "MKVLSPADKTNVKAAW", "MSEQLTNAVLDAGHLR", "MQIFVKTLTGKTITLE"
+    _pair_jsons(d, [(("bait", bait), ("preyA", prey))])
+    monomer.write_monomers(d, [1])
+    _fake_align(d)
+    wrong = os.path.join(d, "msa", "preya", "preya_data.json")
+    md = json.load(open(wrong))
+    md["sequences"][0]["protein"]["sequence"] = other
+    md["sequences"][0]["protein"]["unpairedMsa"] = f">q\n{other}\n"
+    json.dump(md, open(wrong, "w"))
+    os.remove(os.path.join(d, "af3_monomer_list.txt"))
+    shutil.copy(os.path.join(d, "monomers", "preya.json"),
+                os.path.join(d, "monomers", "aaa.json"))
+    md = json.load(open(os.path.join(d, "monomers", "aaa.json")))
+    md["name"] = "aaa"
+    json.dump(md, open(os.path.join(d, "monomers", "aaa.json"), "w"))
+    n, missing = monomer.merge_all(d, [1], python_exe=sys.executable)
+    assert n == 0 and missing == ["bait___preyA"], (n, missing)
+
+
 def test_submit_all_captures_job_ids_for_analyse_chaining():
     """The packed group ids must be captured, because ANALYSE has to depend on
     them and they do not exist until submit_all.sh runs. Chaining analyse on
