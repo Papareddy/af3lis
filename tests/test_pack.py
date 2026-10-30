@@ -285,6 +285,119 @@ def test_monomer_mode_dedups_and_merges_correctly():
     assert n2 == 4 and len(miss2) == 2, (n2, miss2)
 
 
+def _fake_align(d, labels=None):
+    """Write a fake AF3 align output per monomer input, embedding the query
+    so a merged chain can be traced back to the MSA it was given."""
+    import glob, json
+    for mp in glob.glob(os.path.join(d, "monomers", "*.json")):
+        md = json.load(open(mp))
+        lab = md["name"]
+        if labels is not None and lab not in labels:
+            continue
+        p = md["sequences"][0]["protein"]
+        p["unpairedMsa"] = f">q\n{p['sequence']}\n"
+        p["pairedMsa"] = f">q\n{p['sequence']}\n"
+        p["templates"] = []
+        od = os.path.join(d, "msa", lab)
+        os.makedirs(od, exist_ok=True)
+        json.dump(md, open(os.path.join(od, f"{lab}_data.json"), "w"))
+
+
+def _pair_jsons(d, pairs):
+    import json
+    jd = os.path.join(d, "jsons")
+    os.makedirs(jd, exist_ok=True)
+    for (an, aseq), (bn, bseq) in pairs:
+        nm = f"{an}___{bn}"
+        json.dump({"name": nm, "dialect": "alphafold3", "version": 1,
+                   "modelSeeds": [1],
+                   "sequences": [{"protein": {"id": "A", "sequence": aseq}},
+                                 {"protein": {"id": "B", "sequence": bseq}}]},
+                  open(os.path.join(jd, nm + ".json"), "w"))
+
+
+def _assert_each_chain_got_its_own_msa(d):
+    import glob, json
+    merged = glob.glob(os.path.join(d, "out", "*", "*_data.json"))
+    for mp in merged:
+        md = json.load(open(mp))
+        for x in (s["protein"] for s in md["sequences"] if "protein" in s):
+            q = x["unpairedMsa"].split("\n")[1]
+            assert q == x["sequence"], (mp, "MSA belongs to another sequence")
+    return merged
+
+
+def test_monomer_merge_resolves_labels_that_share_a_sequence():
+    """Regression: write_monomers dedups by SEQUENCE but merge_all looked
+    chains up by LABEL, so a second label carrying an already-aligned
+    sequence -- a deliberate homodimer, a duplicated isoform -- had no MSA
+    dir and its pair was reported MISSING. And two different sequences whose
+    labels sanitise to the same name had the second one's pair silently
+    merged onto the FIRST one's MSA. Merge must go label -> sequence ->
+    the MSA computed for that sequence, with no hardlinks."""
+    import sys, tempfile
+    from af3lis import monomer
+    d = tempfile.mkdtemp()
+    bait, prey_a = "MKVLSPADKTNVKAAW", "MSEQLTNAVLDAGHLR"
+    prey_c1, prey_c2 = "MQIFVKTLTGKTITLE", "MADQLTEEQIAEFKEA"
+    _pair_jsons(d, [
+        (("bait", bait), ("bait", bait)),             # literal self-pair
+        (("bait", bait), ("bait_copy", bait)),        # homodimer, 2nd label
+        (("bait", bait), ("preyA", prey_a)),
+        (("bait", bait), ("preyA_copy", prey_a)),     # duplicated isoform
+        (("bait", bait), ("prey+c", prey_c1)),        # sanitises to prey_c
+        (("bait", bait), ("prey_c", prey_c2)),        # ... different sequence
+    ])
+    lf, n = monomer.write_monomers(d, [1])
+    assert n == 4, f"4 unique sequences, got {n}"
+    _fake_align(d)
+    # only what was aligned exists: no msa dir for the duplicate labels
+    msa_dirs = sorted(os.listdir(os.path.join(d, "msa")))
+    assert "bait_copy" not in msa_dirs and "preya_copy" not in msa_dirs, msa_dirs
+    assert len(msa_dirs) == 4, msa_dirs
+
+    nmerged, missing = monomer.merge_all(d, [1], python_exe=sys.executable)
+    assert not missing, missing
+    assert nmerged == 6, nmerged
+    merged = _assert_each_chain_got_its_own_msa(d)
+    assert len(merged) == 6
+    # no hardlink or copy was needed to get there
+    for lab in ("bait_copy", "preya_copy"):
+        assert not os.path.exists(os.path.join(d, "msa", lab))
+
+
+def test_monomer_merge_skips_stale_msa_for_a_changed_sequence():
+    """A rebuilt run dir can hold msa/<label>/ from an EARLIER sequence next
+    to AF3's timestamped sibling with the new one. The stale MSA must never
+    be merged onto the new sequence; with no matching MSA the pair is
+    reported, not faked."""
+    import json, shutil, sys, tempfile
+    from af3lis import monomer
+    d = tempfile.mkdtemp()
+    bait, prey_new, prey_old = "MKVLSPADKTNVKAAW", "MSEQLTNAVLDAGHLR", "MSEQLTNAVLDAGHLK"
+    _pair_jsons(d, [(("bait", bait), ("preyA", prey_new))])
+    monomer.write_monomers(d, [1])
+    _fake_align(d)
+    good = os.path.join(d, "msa", "preya", "preya_data.json")
+    sib = os.path.join(d, "msa", "preya_20261020_101010")
+    os.makedirs(sib)
+    shutil.move(good, os.path.join(sib, "preya_data.json"))
+    stale = json.load(open(os.path.join(sib, "preya_data.json")))
+    stale["sequences"][0]["protein"]["sequence"] = prey_old
+    stale["sequences"][0]["protein"]["unpairedMsa"] = f">q\n{prey_old}\n"
+    json.dump(stale, open(good, "w"))
+
+    n, missing = monomer.merge_all(d, [1], python_exe=sys.executable)
+    assert n == 1 and not missing, (n, missing)
+    _assert_each_chain_got_its_own_msa(d)
+
+    # only the stale one left -> reported missing, nothing written
+    shutil.rmtree(sib)
+    shutil.rmtree(os.path.join(d, "out"))
+    n, missing = monomer.merge_all(d, [1], python_exe=sys.executable)
+    assert n == 0 and missing == ["bait___preyA"], (n, missing)
+
+
 def test_submit_all_captures_job_ids_for_analyse_chaining():
     """The packed group ids must be captured, because ANALYSE has to depend on
     them and they do not exist until submit_all.sh runs. Chaining analyse on

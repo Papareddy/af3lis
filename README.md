@@ -233,6 +233,18 @@ Layout differs only in the align stage: monomer inputs in `monomers/`, their
 MSAs in `msa/<chain>/`, and the bridge writes the merged pairs to the usual
 `out/<pair>/<pair>_data.json`, so packing, scoring and plotting are unchanged.
 
+**Chains are matched by sequence, not by name.** Deduplication is by
+sequence, so a second label carrying an already-aligned sequence — a
+deliberate homodimer, a duplicated isoform, two accessions for one protein —
+gets no `msa/` directory of its own. The merge resolves every pair chain as
+label → sequence → the monomer emitted for that sequence → its MSA, using
+`monomers/*.json` as the record of what was aligned, and it checks the MSA was
+built for exactly that sequence (a stale `msa/<chain>/` left by an earlier
+build is skipped in favour of AF3's timestamped sibling, or reported). Until
+2026-10 the merge matched by label, so those pairs were reported `MISSING`;
+a run dir built before the fix re-merges correctly with
+`python -m af3lis.monomer merge <outdir>`, no rebuild needed.
+
 **Why splicing is sound.** In a pair `_data.json` each protein chain carries
 its own `unpairedMsa`, `pairedMsa` and `templates`; the two chains' `pairedMsa`
 values differ from each other and from their `unpairedMsa`. `pairedMsa` is the
