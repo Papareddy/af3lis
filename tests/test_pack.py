@@ -22,8 +22,70 @@ def test_bucket_of():
     assert bucket_of(100) == 256
     assert bucket_of(512) == 512
     assert bucket_of(513) == 768
-    assert bucket_of(3100) == 4096
-    assert bucket_of(5121) == 6144      # beyond ladder: ceil to 1024
+    assert bucket_of(2049) == 2560
+    assert bucket_of(3100) == 3584
+    # the complex that hit its walltime: AF3 chose 3584, we used to say 4096
+    assert bucket_of(3275) == 3584
+    assert bucket_of(4500) == 4608
+    assert bucket_of(5120) == 5120
+    # beyond the ladder AF3 makes a bucket of exactly the token count
+    assert bucket_of(5121) == 5121
+
+
+def test_buckets_match_af3_v301_default():
+    """pack.BUCKETS must be AF3's own ladder, or groups are sized for a
+    bucket AF3 does not use. Source: the --buckets flag default of
+    run_alphafold.py at tag v3.0.1."""
+    from af3lis.pack import BUCKETS
+    af3_v301 = [256, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072,
+                3584, 4096, 4608, 5120]
+    assert BUCKETS == af3_v301, BUCKETS
+
+
+def test_default_table_covers_every_bucket_and_is_monotonic():
+    from af3lis.pack import BUCKETS, DEFAULT_CALIB, default_sec
+    assert sorted(DEFAULT_CALIB) == BUCKETS, "a bucket has no built-in time"
+    prev = 0.0
+    for b in BUCKETS:
+        assert DEFAULT_CALIB[b] >= prev, (b, DEFAULT_CALIB[b], prev)
+        prev = DEFAULT_CALIB[b]
+    # above the ladder: extrapolated upwards, never the old flat 700 s
+    assert default_sec(6000) > DEFAULT_CALIB[5120]
+    assert default_sec(8192) > default_sec(6000)
+
+
+def test_measured_3584_condition_fits_its_walltime():
+    """One 3,275-token condition needed 1:28:02 of job time on the
+    large-model tier and was killed at the 1:10 it was sized for. With the
+    default startup/compile/safety it must now get at least that."""
+    with tempfile.TemporaryDirectory() as td:
+        d = os.path.join(td, "data_x.json")
+        open(d, "w").write("{}")
+        recs = [dict(lname="x", data=d, bucket=bucket_of(3275), nseeds=1)]
+        from af3lis.pack import DEFAULT_CALIB
+        calib = {int(k): float(v) for k, v in DEFAULT_CALIB.items()}
+        g, = build_groups(recs, os.path.join(td, "pack"), target_hours=1.5,
+                          safety=1.3, calib=calib, startup=DEFAULT_STARTUP,
+                          compile_s=DEFAULT_COMPILE)
+        h, m, sec = (int(x) for x in g["walltime"].split(":"))
+        measured = 1 * 3600 + 28 * 60 + 2
+        assert h * 3600 + m * 60 + sec >= measured, g["walltime"]
+        assert g["bucket"] == 3584
+
+
+def test_beyond_ladder_groups_are_sized_upwards():
+    """A 6000-token input must not be sized below a 5120 one (it was: an
+    untabled bucket fell back to a flat 700 s)."""
+    from af3lis.pack import DEFAULT_CALIB
+    with tempfile.TemporaryDirectory() as td:
+        d = os.path.join(td, "data_big.json")
+        open(d, "w").write("{}")
+        calib = {int(k): float(v) for k, v in DEFAULT_CALIB.items()}
+        g, = build_groups([dict(lname="big", data=d, bucket=bucket_of(6000),
+                                nseeds=1)],
+                          os.path.join(td, "pack"), 1.5, 1.0, calib, 0.0, 0.0)
+        assert g["bucket"] == 6000
+        assert g["est_s"] > DEFAULT_CALIB[5120], g["est_s"]
 
 
 def test_token_count_multiplicity():
@@ -126,7 +188,7 @@ def test_resources_for_ladder():
     from af3lis.pack import resources_for
     # small + mid buckets must stay UNDER 64gb, or they lose the 26 abundant
     # 40GB gpu4 nodes and queue behind 4 scarce gpu8 nodes instead.
-    for b in (256, 512, 768, 1024, 1280, 1536, 2048, 3072):
+    for b in (256, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072):
         r = resources_for(b)
         mem_gb = int(r["mem"].replace("gb", ""))
         assert mem_gb < 64, (b, r["mem"])
@@ -135,8 +197,9 @@ def test_resources_for_ladder():
         # ~2h15m of queue and A40 ~3h23m versus an unpinned request, for no
         # benefit at these sizes.
         assert r["gres"] == "gpu:1", (b, r["gres"])
-    # big buckets escalate deliberately
-    for b in (4096, 5120, 8192):
+    # big buckets escalate deliberately (3584 is where AF3's ladder first
+    # crosses 3072 tokens)
+    for b in (3584, 4096, 4608, 5120, 8192):
         r = resources_for(b)
         assert int(r["mem"].replace("gb", "")) >= 64
         assert r["flash_attn"] == "xla"

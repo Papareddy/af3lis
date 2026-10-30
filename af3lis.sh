@@ -161,7 +161,7 @@ EOF
     chk "PAE panels"               "$(find "$D/figures/pae" -name '*.png' 2>/dev/null | wc -l)" 1
     # Packed grouping. NOTE: the smoke fixture is deliberately small, so both
     # of its buckets sit on the same 48gb tier -- ONE distinct --mem is the
-    # correct result here. The >=4096-token escalation is covered by
+    # correct result here. The >3072-token escalation is covered by
     # tests/test_pack.py::test_resources_for_ladder, not by this run.
     if [ -s "$D/af3pack/groups.tsv" ]; then
       NMEM=$(awk -F'\t' 'NR>1{print $7}' "$D/af3pack/groups.tsv" | sort -u | wc -l)

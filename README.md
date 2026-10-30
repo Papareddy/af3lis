@@ -116,14 +116,16 @@ gives you partial results plus an explicit list of what to re-run.
 Each packed job holds exactly **one token bucket**, so its size class is known
 before submission and the job can ask for what it actually needs. AF3 pads
 every input up to the next bucket on its ladder
-(256, 512, 768, 1024, 1280, 1536, 2048, 3072, 4096, 5120), and
+(256, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3584, 4096, 4608, 5120 —
+the `--buckets` default of `run_alphafold.py` in AF3 v3.0.1; above 5120 AF3
+makes a bucket of exactly the input's token count), and
 `af3lis.pack.resources_for()` maps that bucket onto SLURM resources:
 
 | tokens (bucket) | `--gres` | `--mem` | flash attention | `XLA_CLIENT_MEM_FRACTION` | why |
 |---|---|---|---|---|---|
 | ≤ 1536 | **`gpu:1`** | **48gb** | `triton` | 3.2 | any GPU type; 48 GB keeps the **26 abundant gpu4 nodes** eligible |
 | 2048–3072 | **`gpu:1`** | 60gb | `triton` | 3.2 | any type, still under the 64 GB cutoff; more host RAM for spill |
-| ≥ 4096 | **`gpu:1`** | 96gb | `xla` | 4.0 | any type; ≥64 GB reaches the large nodes, XLA kernel + a 4.0 unified-memory pool covers a smaller card |
+| ≥ 3584 | **`gpu:1`** | 96gb | `xla` | 4.0 | any type; ≥64 GB reaches the large nodes, XLA kernel + a 4.0 unified-memory pool covers a smaller card |
 
 **The ladder never names a card.** Measured with `sbatch --test-only`, same
 job, same `--mem`:
@@ -169,16 +171,16 @@ guarantee a large card either. `--mem` remains the real lever.
 
 > **How much of the ladder is measured?** The ≤1536 / 48gb tier encodes Mau's
 > own documented constraint and his measured queue behaviour. The 2048–3072 and
-> ≥4096 tiers are **extrapolations**, not measurements — his timing table
-> covers buckets 512 and 768 only, and a 5-seed run confirmed the extrapolated
-> buckets over-ask by ~2.4×. Run `--probe` + `calibrate.py` before trusting
-> them on a new size class.
+> ≥3584 tiers are **extrapolations**, not measurements, apart from one
+> 3,275-token condition timed on the large tier (below). Run `--probe` +
+> `calibrate.py` before trusting them on a new size class.
 
 **The memory ladder is not "bigger is safer".** On bwHelix, asking for
 **≥ 64 GB excludes the 26 abundant 40 GB gpu4 nodes** and restricts the job to
 4 scarce gpu8 nodes. A needlessly large `--mem` therefore costs hours of queue
 time, not just accounting. Small buckets stay at 48 GB on purpose; only
-≥ 4096-token jobs escalate, because those genuinely will not fit otherwise.
+>3072-token jobs (bucket 3584 up) escalate, because those genuinely will not
+fit otherwise.
 
 Everything above is emitted into `af3pack/submit_all.sh` as explicit `sbatch`
 overrides and recorded in `groups.tsv`, so the choice is auditable after the
@@ -187,8 +189,8 @@ fact:
 ```bash
 # groups.tsv
 group             bucket  n_conditions  est_min  walltime  gres        mem    flash_attn  xla_mem_frac  members
-group_000_b768    768     6             44.7     01:00:00  gpu:A100:1  48gb   triton      3.2           ...
-group_003_b4096   4096    2             180.0    04:00:00  gpu:A100:1  96gb   xla         4.0           ...
+group_000_b768    768     6             44.7     01:00:00  gpu:1       48gb   triton      3.2           ...
+group_003_b3584   3584    1             92.2     02:00:00  gpu:1       96gb   xla         4.0           ...
 ```
 
 ### Whose strategy this is
@@ -277,10 +279,23 @@ larger but harder to measure without a matched control.
 
 Walltime per group is
 `(startup + compile + n_conditions × sec_per_condition × n_seeds) × safety`.
-The built-in `sec_per_condition` table was measured only at buckets **512 and
-768**; everything else is a `bucket^2.2` extrapolation and over-asks by roughly
-2.4×, which hurts backfill. For a new size class or a different GPU, measure
-first:
+The built-in `sec_per_condition` table is conservative on purpose — an
+over-ask costs little queue time here, an under-ask kills the job at its
+walltime after the GPU time is spent. It covers every bucket on AF3's ladder:
+
+| bucket | s / condition | basis |
+|---|---|---|
+| 512, 768 | 35, 85 | **measured** on A100 (Mau) |
+| 1024, 1280 | 160, 260 | a later probe measured ~87 / ~140 s, startup included |
+| 3584 | 5400 | **measured**: one 3,275-token condition took 1:28:02 of job time on the large tier |
+| 4096, 4608, 5120 | 7300, 9400, 11,900 | `bucket^2.2` from the 3584 measurement |
+| the rest | | `bucket^2.2` between measured points; above 5120, extrapolated the same way |
+
+The 3584 point is why the large buckets went **up**: AF3 ran that complex in
+bucket 3584, which this ladder did not have, so it was sized as a 4096 at
+3000 s, killed at 1:10, and finished in 1:28 when resubmitted with 4 h. A table
+that gives a 4096 less time than a measured 3584 needed is not conservative.
+For a new size class or a different GPU, measure first:
 
 ```bash
 bash af3lis.sh run --chains-tsv chains.tsv --name Probe --probe 10   # one short GPU job
@@ -449,7 +464,7 @@ the align array finishes and before the bridge starts, delete one pair's MSA
 directory. The bridge should exclude it and print a `MISSING:` line, and the
 analyse job should still score the other 11.
 
-Two things the smoke test does **not** cover, by design: the ≥4096-token memory
+Two things the smoke test does **not** cover, by design: the >3072-token memory
 tier of the resource ladder (reaching it needs a ~1500 aa partner, which is no
 longer a small job — `tests/test_pack.py` covers that branch instead), and
 real walltime calibration for large buckets.

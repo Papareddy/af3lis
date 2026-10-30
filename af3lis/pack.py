@@ -20,10 +20,11 @@ rendered ``pack_infer.sbatch`` (which carries our Helix XLA/memory env).
 Timing model per group (Mau's, unchanged):
     walltime = (startup + compile + n_conditions * sec[bucket] * n_seeds) * safety
 
-The default per-bucket table is A100; ONLY buckets 512/768 were measured
-(~30/~75 s per condition, 1 seed x 5 samples) -- larger buckets are ~bucket^2.2
-extrapolations. Run a probe group + ``python -m af3lis.calibrate`` and pass
-``--calib calib.json`` before sizing a real campaign on a new size class / GPU.
+The default per-bucket table is deliberately conservative. Buckets 512/768
+were measured on A100 (~30/~75 s per condition, 1 seed x 5 samples) and 3584
+on the large-model tier; the rest are ~bucket^2.2 interpolations. Run a probe
+group + ``python -m af3lis.calibrate`` and pass ``--calib calib.json`` before
+sizing a real campaign on a new size class / GPU.
 
 CLI:
     python -m af3lis.pack --outdir runs/SCREEN [--target-hours 1.5]
@@ -40,14 +41,34 @@ import os
 import sys
 from collections import Counter
 
-# AF3 default token-bucket ladder (inputs are padded up to these sizes).
-BUCKETS = [256, 512, 768, 1024, 1280, 1536, 2048, 3072, 4096, 5120]
+# AF3's default token-bucket ladder: an input is padded up to the smallest
+# bucket >= its token count, and XLA compiles once per bucket. This is the
+# --buckets flag default of run_alphafold.py at tag v3.0.1
+# (https://github.com/google-deepmind/alphafold3/blob/v3.0.1/run_alphafold.py).
+# Above the largest bucket AF3 makes a new bucket of EXACTLY the token count
+# (pipeline.calculate_bucket_size), so each such input compiles on its own.
+# This list used to skip 2560/3584/4608, so a 3,275-token complex that AF3 ran
+# in bucket 3584 was sized here as a 4096 -- and still hit its walltime.
+BUCKETS = [256, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3584, 4096,
+           4608, 5120]
 
-# Seconds per condition (1 seed x 5 diffusion samples) on A100-40GB.
-# 512 and 768 MEASURED on bwHelix (Mau, Aug 2026); the rest are conservative
-# ~bucket^2.2 extrapolations. Recalibrate for other GPUs / size classes.
+# Seconds per condition (1 seed x 5 diffusion samples). Conservative on
+# purpose: an over-ask costs little queue time on this cluster, an under-ask
+# kills the job at its walltime after the GPU time is spent.
+#   * 512 / 768   MEASURED on A100 (Mau, Aug 2026).
+#   * 1024 / 1280 a later probe measured ~87 / ~140 s per condition, startup
+#                 included; the table stays above that.
+#   * 3584        MEASURED on the large-model tier (XLA attention, 96gb, any
+#                 card): one 3,275-token condition needed 1:28:02 of job time,
+#                 startup included. 5400 s covers it.
+#   * 4096-5120   re-anchored on the 3584 measurement at ~bucket^2.2. They
+#                 were 3000 / 4800, i.e. LESS than a smaller input measured.
+#   * the rest    ~bucket^2.2 interpolations between measured points.
+# Recalibrate (--probe + af3lis.calibrate) for other GPUs / size classes.
 DEFAULT_CALIB = {256: 15, 512: 35, 768: 85, 1024: 160, 1280: 260, 1536: 380,
-                 2048: 700, 3072: 1600, 4096: 3000, 5120: 4800}
+                 2048: 700, 2560: 1150, 3072: 1600, 3584: 5400, 4096: 7300,
+                 4608: 9400, 5120: 11900}
+SCALING_EXPONENT = 2.2   # seconds ~ bucket^2.2 between and beyond measurements
 # ---------------------------------------------------------------------------
 # Size-aware SLURM resources.
 #
@@ -59,7 +80,8 @@ DEFAULT_CALIB = {256: 15, 512: 35, 768: 85, 1024: 160, 1280: 260, 1536: 380,
 # "bigger is safer": asking >= 64 GB excludes the 26 abundant 40 GB gpu4 nodes
 # and restricts the job to 4 scarce gpu8 nodes, so a needlessly large --mem
 # costs hours of queue. Small buckets therefore stay at 48 GB deliberately;
-# only >= 4096 tokens escalates, because those genuinely need an 80 GB card.
+# only > 3072 tokens (bucket 3584 and up) escalates, because those genuinely
+# need a large card or a host-memory spill.
 #
 # Do NOT pin a GPU type unless the size class needs one. Measured with
 # `sbatch --test-only` on bwHelix, same job, same --mem:
@@ -77,9 +99,9 @@ DEFAULT_CALIB = {256: 15, 512: 35, 768: 85, 1024: 160, 1280: 260, 1536: 380,
 #
 # NB `gpumem_per_gpu` does NOT influence scheduling here: 40G/48G/80G all
 # return the same estimate as an unpinned request, so it cannot be used to
-# guarantee a large card. Above 4096 tokens the type is pinned explicitly and
-# --mem is the real lever (>=64gb restricts to the scarce gpu8 nodes, which is
-# exactly what a big model needs and what a small one must avoid).
+# guarantee a large card. --mem is the real lever (>=64gb restricts to the
+# scarce gpu8 nodes, which is exactly what a big model needs and what a small
+# one must avoid).
 #
 # (bucket_max, gres, mem, flash_attn, xla_mem_frac, note)
 RESOURCE_LADDER = [
@@ -88,7 +110,7 @@ RESOURCE_LADDER = [
     (3072, "gpu:1", "60gb", "triton", 3.2,
      "any GPU type, still under the 64gb gpu4 cutoff; more host RAM for spill"),
     (10 ** 9, "gpu:1", "96gb", "xla", 4.0,
-     ">=4096 tokens: any type; >=64gb reaches the big nodes, XLA kernel + a "
+     ">3072 tokens: any type; >=64gb reaches the big nodes, XLA kernel + a "
      "4.0 unified-memory pool covers a smaller card by spilling to host"),
 ]
 
@@ -125,11 +147,24 @@ DEFAULT_COMPILE = 40.0    # per-bucket compile (s); 1 bucket/group -> paid once
 
 
 def bucket_of(tokens: int) -> int:
-    """Smallest ladder bucket >= tokens; beyond the ladder, round up to 1024."""
+    """AF3's bucket for an input: the smallest ladder bucket >= tokens, and
+    above the ladder exactly `tokens` -- AF3 makes a bucket of that size."""
     for b in BUCKETS:
         if tokens <= b:
             return b
-    return int(math.ceil(tokens / 1024.0) * 1024)
+    return int(tokens)
+
+
+def default_sec(bucket: int) -> float:
+    """Built-in seconds per condition for any bucket, including AF3's
+    exact-size buckets above the ladder (~bucket^2.2 from the largest tabled
+    bucket below). An untabled bucket used to get a flat 700 s -- a
+    6000-token input sized at a seventh of a 5120 one."""
+    if bucket in DEFAULT_CALIB:
+        return float(DEFAULT_CALIB[bucket])
+    below = [b for b in DEFAULT_CALIB if b <= bucket]
+    ref = max(below) if below else min(DEFAULT_CALIB)
+    return float(DEFAULT_CALIB[ref]) * (bucket / ref) ** SCALING_EXPONENT
 
 
 def token_count(input_json: dict) -> int:
@@ -232,7 +267,7 @@ def build_groups(records: list[dict],
     gi = 0
     for b in sorted(by_bucket):
         recs = by_bucket[b]
-        sec = calib.get(b, DEFAULT_CALIB.get(b, 700.0))
+        sec = calib.get(b, default_sec(b))
         # conditions per group budgeted at the bucket's modal seed count
         nseeds_mode = Counter(r["nseeds"] for r in recs).most_common(1)[0][0]
         per = max(1, int((tgt - startup - compile_s) // max(sec * nseeds_mode, 1.0)))
