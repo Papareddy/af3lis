@@ -57,3 +57,9 @@ infer.sbatch
 SUBMIT_CMDS.sh
 af3_json_list.txt
 RUNBOOK.md
+
+# --- local spill (never commit) ---
+# R's default graphics device writes Rplots.pdf into the cwd.
+Rplots.pdf
+# Written by a local session hook; holds machine-specific paths.
+HANDOFF_AUTO.md
