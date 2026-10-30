@@ -33,7 +33,7 @@ Guards, each recorded in the output's ``_meta``:
     next to where the calibration would have gone.
 
 Usage:
-    python -m af3lis.calibrate <outdir>/logs/pack_*.out --out calib.json
+    python -m af3lis.calibrate <outdir>/logs/pack_af3pack_group_*.out --out calib.json
     python pipeline.py --pack --outdir <outdir> --calib calib.json
 """
 from __future__ import annotations
@@ -212,7 +212,8 @@ def calibrate(log_paths, compile_s: float = 40.0, nseeds: int | None = None,
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("logs", nargs="+",
-                    help="packed jobs' slurm-out files (logs/pack_*.out); "
+                    help="packed jobs' slurm-out files "
+                         "(logs/pack_af3pack_group_*.out); "
                          "each is parsed on its own")
     ap.add_argument("--out", default="calib.json")
     ap.add_argument("--seeds", type=int, default=None,

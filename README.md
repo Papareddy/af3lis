@@ -871,7 +871,7 @@ before the fix**, so check yours against the middle column.
 | what was wrong | what it did to earlier runs | now |
 |---|---|---|
 | Config keys `infer_gpu_gres`, `align_extra`, `infer_extra` were never read — the code reads `gpu_gres`, `af3_data_extra`, `af3_infer_extra` — and unknown keys were stored silently. | The fallback `#SBATCH --gres` was always the built-in `gpu:A100:1`, and extra align/infer flags set in a config never reached AF3. Packed groups were unaffected: they override `--gres` per bucket. | Legacy names are aliases with a deprecation note, every unread key is warned, and the default is `gpu:1`. See [Configuration](#configuration). |
-| Calibration timed the gap between any two bucket lines, and `--pack` loaded `<outdir>/calib.json` without `--calib`. | A multi-seed calibration came out several-fold too fast, and any run dir holding a `calib.json` was sized from it. A missing `--calib` file crashed the bridge. | Per-condition, seed-aware timing; used only when named; > 2× faster than the built-in table refused; `calib_used.json` records what sized each pack. See [Walltime sizing](#walltime-sizing-and-why-you-should-calibrate). |
+| Calibration timed the gap between any two bucket lines, and `--pack` loaded `<outdir>/calib.json` without `--calib`. | A multi-seed calibration came out several-fold too fast, and any run dir holding a `calib.json` was sized from it. A missing `--calib` file crashed `--pack` with a traceback. | Per-condition, seed-aware timing; used only when named; > 2× faster than the built-in table refused; `calib_used.json` records what sized each pack. See [Walltime sizing](#walltime-sizing-and-why-you-should-calibrate). |
 | The monomer merge looked chains up by label, while alignment deduplicates by sequence. | Pairs whose label shared a sequence with another — a homodimer, a duplicated isoform — were reported `MISSING`. Two different sequences whose labels sanitise to the same name had the second folded on the first one's MSA. | Chains resolve via their sequence and the MSA's query is checked. Old run dirs re-merge without a rebuild: `python -m af3lis.monomer merge <outdir>`. |
 | The bucket ladder lacked AF3's 2560, 3584 and 4608. | Inputs in those buckets were sized as the next bucket up. Harmless where that over-asks, but the old 4096 and 5120 times were below what a 3584 input measured, so large inputs could hit their walltime. | AF3 3.0.1's ladder verbatim, and the large-bucket times re-anchored on a measured 3584 condition. |
 
@@ -881,8 +881,10 @@ before the fix**, so check yours against the middle column.
   pack-stage options `--target-hours`, `--safety`, `--probe`,
   `--pack-max-jobs` and `--pack-copy` are accepted there and do nothing.
   `--calib` is the exception (it is rendered into the bridge). Set
-  `target_hours` in `config.yaml`, which the bridge does read, or pack by hand
-  as in [Walltime sizing](#walltime-sizing-and-why-you-should-calibrate).
+  `target_hours` in the config used at build time: it is rendered into
+  `pack_bridge.sbatch` then, so editing the config afterwards changes nothing.
+  Rebuild (`--rebuild`) to change it, or pack by hand as in
+  [Walltime sizing](#walltime-sizing-and-why-you-should-calibrate).
 * **The ≥ 3584-token times rest on one measured condition.** They are
   deliberately generous; calibrate before a campaign dominated by large
   complexes. Such a probe is one long job: `--probe 5` at 3584 asks ~10 h of

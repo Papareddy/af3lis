@@ -14,8 +14,11 @@
 # and returns immediately. Nothing else is needed; metrics.tsv, figures/ and
 # the PDB exports appear under the run directory when the last job finishes.
 #
-# Every option not listed below is passed straight through to pipeline.py, so
-# `--seeds 1,2,3`, `--mode complex`, `--target-hours 2` etc all work here.
+# Every option not listed below is passed straight through to the BUILD step
+# of pipeline.py, so build options such as `--seeds 1,2,3`, `--mode complex`
+# and `--calib` work here. Pack-stage options (`--target-hours`, `--safety`,
+# `--probe`, ...) are ignored by `run`: set target_hours in config.yaml before
+# the build (README, "Known issues").
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CMD="${1:-help}"; shift || true
