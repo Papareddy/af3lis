@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -89,9 +90,11 @@ _DEFAULT_CFG: dict[str, Any] = {
     "align_mem": "64gb",
     "align_cpus": "16",
     "af3_data_extra": "",
-    # infer (GPU)
+    # infer (GPU). Never name a card: unpinned starts earliest at every size
+    # class measured (see af3lis/pack.py RESOURCE_LADDER). This is only the
+    # fallback #SBATCH line -- the packed route overrides it per bucket.
     "infer_partition": "gpu-single",
-    "gpu_gres": "gpu:A100:1",
+    "gpu_gres": "gpu:1",
     "infer_time": "02:00:00",
     "infer_mem": "60gb",
     "infer_cpus": "8",
@@ -115,19 +118,96 @@ _NESTED_MAP = {
 }
 
 
+# Optional keys: read with cfg.get(key, default) somewhere in the pipeline, so
+# they have no entry in _DEFAULT_CFG but are legitimate in a config file.
+_OPTIONAL_KEYS = {
+    "seeds", "align_mode", "max_array_size", "target_hours",
+    "analyse_time", "analyse_mem", "analyse_cpus", "agg", "out_subdir",
+    "peak_bar", "ilis_bar", "collect_extra", "pdb_extra",
+}
+
+# Legacy spellings, accepted as aliases of the canonical key. Every config
+# written before 2026-10 used these, and the parser used to store them under
+# their own name, where nothing read them: `infer_gpu_gres` never reached the
+# #SBATCH line, so the built-in default won whatever the config said.
+_KEY_ALIASES = {
+    "infer_gpu_gres": "gpu_gres",
+    "align_extra": "af3_data_extra",
+    "infer_extra": "af3_infer_extra",
+}
+
+# Keys old configs carry that nothing reads. Accepted with a note, so a stale
+# config does not look like a typo, but the note says the value has no effect.
+_RETIRED_KEYS = {
+    "infer_gpumem": "nothing reads it; gpumem_per_gpu does not influence "
+                    "scheduling here and --mem is the real lever",
+}
+
+
 def _strip_quotes(v: str) -> str:
     return v.strip().strip('"').strip("'")
 
 
-def load_config(path: str | None) -> dict[str, Any]:
+def _canonical_key(k: str) -> str | None:
+    """Canonical config name for `k`, or None if nothing reads it."""
+    if k in _DEFAULT_CFG or k in _OPTIONAL_KEYS:
+        return k
+    return _KEY_ALIASES.get(k)
+
+
+def _unknown_key_warning(k: str) -> str:
+    import difflib
+    known = sorted(set(_DEFAULT_CFG) | _OPTIONAL_KEYS | set(_KEY_ALIASES))
+    near = difflib.get_close_matches(k, known, n=1)
+    # never steer anyone towards a legacy spelling
+    near = [_KEY_ALIASES.get(n, n) for n in near]
+    hint = f" (did you mean '{near[0]}'?)" if near else ""
+    return (f"unknown config key '{k}' is IGNORED -- nothing reads it{hint}")
+
+
+def parse_config(path: str | None) -> tuple[dict[str, Any], list[str]]:
     """Tolerant YAML-ish parser (same idea as boltzlis.load_config) supporting
     flat `key: value` AND one level of `section:` / two-space-indented children
     so the on-cluster config.example.yaml shape Just Works.
-    Returns a flat dict keyed by _DEFAULT_CFG names.
+
+    Returns (cfg, warnings). cfg is a flat dict keyed by canonical names.
+    A key nothing reads is never stored silently: legacy spellings are mapped
+    onto their canonical name, retired keys are dropped with a note, and
+    anything else is dropped with a warning naming the nearest real key.
     """
     cfg: dict[str, Any] = dict(_DEFAULT_CFG)
+    warnings: list[str] = []
     if not (path and os.path.exists(path)):
-        return cfg
+        return cfg, warnings
+    # canonical key -> (spelling that set it, raw value). The canonical
+    # spelling beats an alias whatever the order; otherwise the last line
+    # wins, as it always did.
+    set_by: dict[str, tuple[str, str]] = {}
+
+    def put(k: str, v: str, where: str) -> None:
+        if k in _RETIRED_KEYS:
+            warnings.append(f"config key '{where}' is ignored: "
+                            f"{_RETIRED_KEYS[k]}")
+            return
+        canon = _canonical_key(k)
+        if canon is None:
+            warnings.append(_unknown_key_warning(where))
+            return
+        prev = set_by.get(canon)
+        if prev is not None and prev[1] != v:
+            if prev[0] == canon and k != canon:
+                warnings.append(f"'{where}' and '{canon}' disagree; the "
+                                f"canonical {canon}={prev[1]!r} wins")
+                return
+            if prev[0] != canon and k == canon:
+                warnings.append(f"'{prev[0]}' and '{canon}' disagree; the "
+                                f"canonical {canon}={v!r} wins")
+        if k != canon:
+            warnings.append(f"config key '{where}' is a deprecated alias of "
+                            f"'{canon}' -- read as {canon}={v!r}; rename it")
+        cfg[canon] = _parse_seeds_value(v) if canon == "seeds" else v
+        set_by[canon] = (k, v)
+
     current_section: str | None = None
     with open(path) as fh:
         for raw in fh:
@@ -147,18 +227,40 @@ def load_config(path: str | None) -> dict[str, Any]:
                 if v == "" and k in _NESTED_MAP:
                     current_section = k
                     continue
+                if v == "" and _canonical_key(k) is None \
+                        and k not in _RETIRED_KEYS:
+                    # an unknown `section:` header -- its children are
+                    # resolved as flat keys below
+                    warnings.append(f"unknown config section '{k}:' -- its "
+                                    f"children are read as top-level keys")
+                    continue
                 # seeds: [1,2,3]   or   seeds: 1
-                if k == "seeds":
-                    cfg["seeds"] = _parse_seeds_value(v)
-                else:
-                    cfg[k] = v
+                put(k, v, k)
             else:
                 if current_section and current_section in _NESTED_MAP:
                     flat = _NESTED_MAP[current_section].get(k)
                     if flat:
-                        cfg[flat] = v
+                        put(flat, v, f"{current_section}.{k}")
+                    else:
+                        # a flat name under its section (`infer: gpu_gres:`
+                        # or the legacy `infer: infer_gpu_gres:`)
+                        put(k, v, f"{current_section}.{k}")
                 else:
-                    cfg[k] = v
+                    put(k, v, k)
+    if re.match(r"^gpu:[A-Za-z]", str(cfg.get("gpu_gres", ""))):
+        # honoured (it is the user's call), but say what it costs
+        warnings.append(f"gpu_gres={cfg['gpu_gres']} pins a card type; the "
+                        f"resource ladder never does, because an unpinned "
+                        f"gpu:1 started earliest at every size class measured "
+                        f"(only the legacy --array-infer route uses this line)")
+    return cfg, warnings
+
+
+def load_config(path: str | None) -> dict[str, Any]:
+    """parse_config, with every warning printed to stderr."""
+    cfg, warnings = parse_config(path)
+    for w in warnings:
+        sys.stderr.write(f"[config] WARNING: {w}  ({path})\n")
     return cfg
 
 
@@ -689,7 +791,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--organism-id", type=int, default=3702,
                     help="UniProt taxonomy ID for TAIR-locus resolution "
                          "(default 3702 = A. thaliana)")
-    ap.add_argument("--config", default=os.path.join(HERE, "config.yaml"))
+    ap.add_argument("--config", default=None,
+                    help="config file (default: config.yaml next to pipeline.py)")
     ap.add_argument("--rebuild", action="store_true",
                     help="force re-emit JSONs/sbatches even if outdir is non-empty")
 
@@ -769,6 +872,13 @@ def _build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     ap = _build_argparser()
     a = ap.parse_args()
+    if a.config is None:
+        a.config = os.path.join(HERE, "config.yaml")
+    elif not os.path.exists(a.config):
+        # an explicit --config that does not exist used to fall back to the
+        # built-in defaults without a word -- placeholder paths and all
+        sys.stderr.write("[config] WARNING: --config %s does not exist -- "
+                         "running on the built-in defaults\n" % a.config)
     cfg = load_config(a.config)
     cfg_path = a.config if (a.config and os.path.exists(a.config)) else None
 

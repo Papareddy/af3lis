@@ -559,7 +559,7 @@ align_cpus: 8                       # also why you want 40gb+ or you will get OO
 
 # --- inference stage (GPU) -- fallbacks; af3lis.pack overrides per bucket
 infer_partition: gpu-single
-infer_gpu_gres: gpu:A100:1
+gpu_gres: gpu:1                     # never name a card (see the resource ladder)
 infer_mem: 60gb
 xla_mem_frac: 3.2
 flash_attn: triton
@@ -572,6 +572,27 @@ agg: per_seed
 peak_bar: 0.70                      # hit thresholds used by the figures
 ilis_bar: 0.23
 ```
+
+**Every key is checked against what the pipeline reads.** A key nothing reads
+is reported on every run — `[config] WARNING: unknown config key 'infer_gres'
+is IGNORED -- nothing reads it (did you mean 'gpu_gres'?)` — instead of being
+stored where nothing looks. That is not pedantry: until 2026-10 every shipped
+config wrote `infer_gpu_gres`, the renderer read `gpu_gres`, and the configured
+value never reached a single `#SBATCH` line. Three legacy spellings are still
+accepted, each with a note to rename it:
+
+| legacy key | canonical key | what it sets |
+|---|---|---|
+| `infer_gpu_gres` | `gpu_gres` | fallback `--gres` (the packed route overrides it per bucket) |
+| `align_extra` | `af3_data_extra` | extra flags for the align stage |
+| `infer_extra` | `af3_infer_extra` | extra flags for inference |
+
+If a config carries both spellings, the canonical one wins and the
+disagreement is reported. `infer_gpumem` is accepted and ignored with a note —
+GPU memory is not schedulable here, `--mem` is. A `gpu_gres` that names a card
+is honoured but flagged, because the ladder's measurements say it costs queue
+time. An explicit `--config` that does not exist is reported too, rather than
+quietly running on the built-in placeholders.
 
 `env/activate.sh` (written by `setup`) resolves the analysis interpreter.
 `AF3LIS_PYTHON` overrides it, `AF3LIS_DIR` overrides the repo location, and

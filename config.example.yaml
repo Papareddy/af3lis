@@ -1,6 +1,13 @@
 # Copy to config.yaml (gitignored) and edit for your cluster. Simple key: value.
 # AF3 mirror of boltzlis config.example.yaml.
 # Generic placeholders only -- never commit real cluster paths or usernames.
+#
+# Every key below is one the pipeline actually reads. A key it does not read
+# is reported as a WARNING on every run (with the nearest real key), so a typo
+# can no longer be silently ignored. Older configs used three legacy names --
+# infer_gpu_gres, align_extra, infer_extra -- which are still accepted as
+# aliases of gpu_gres, af3_data_extra and af3_infer_extra, with a note to
+# rename them.
 
 # AF3 module on the cluster. Loaded by both align + infer sbatches.
 # Module sets $ALPHAFOLD_BIN_DIR and $ALPHAFOLD_DATABASES for you.
@@ -38,7 +45,7 @@ align_time: 06:00:00
 align_mem: 64gb
 align_cpus: 16
 # Extra flags appended to the alignment stage (e.g. --max_template_date=2024-01-01).
-align_extra: ""
+af3_data_extra: ""
 
 # ----- SLURM: inference stage (GPU diffusion) -----
 # These settings feed BOTH infer routes: the per-task array (infer.sbatch) and
@@ -46,14 +53,15 @@ align_extra: ""
 # recommended for big screens on low fairshare; packed jobs get their walltime
 # from the pack sizing, not infer_time).
 infer_partition: gpu-single
-# Helix-specific GRES; use 'gpu:1' for generic SLURM.
-# NB bwHelix + A100: asking >=64G memory excludes the 26 abundant 40GB gpu4
-# nodes and restricts you to 4 scarce gpu8 nodes -- keep 48-60gb unless needed.
-infer_gpu_gres: gpu:A100:1
-# Minimum GPU memory hint (informational; SLURM gres carries the real constraint).
-# A100-40GB clears ~3100-residue complexes with xla_mem_frac >= 3.0; for >3500
-# residues prefer A100-80GB and set flash_attn=xla.
-infer_gpumem: 40G
+# Fallback --gres for the #SBATCH line. Packed jobs override it per token
+# bucket (af3lis/pack.py RESOURCE_LADDER), and that ladder never names a card:
+# an unpinned request starts earliest at every size class measured, and
+# pinning A100 cost ~2h of queue. Keep this unpinned too.
+# NB bwHelix: asking >=64G memory excludes the 26 abundant 40GB gpu4 nodes
+# and restricts you to 4 scarce gpu8 nodes -- keep 48-60gb unless needed.
+# (There is deliberately no GPU-memory key: gpumem_per_gpu does not influence
+# scheduling here, and an old `infer_gpumem` line is ignored with a note.)
+gpu_gres: gpu:1
 # Bump to 06:00:00 for >2500-residue complexes (large-complex class).
 infer_time: 02:00:00
 infer_mem: 60gb
@@ -70,7 +78,7 @@ flash_attn: triton
 num_samples: 5
 num_recycles: 10
 # Extra flags appended to the inference stage.
-infer_extra: ""
+af3_infer_extra: ""
 
 # ----- AF3 sampling -----
 # list[int]; total samples per pair = len(seeds) * num_samples.
