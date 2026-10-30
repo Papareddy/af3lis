@@ -54,6 +54,30 @@ def test_default_table_covers_every_bucket_and_is_monotonic():
     assert default_sec(8192) > default_sec(6000)
 
 
+def test_no_size_class_gets_less_time_than_before_the_ladder_changed():
+    """Adding AF3's 2560/3584/4608 buckets must never LOWER the walltime ask
+    for an input: the old table is what the last campaign ran and finished
+    with, and an unmeasured interpolation is not a reason to cut it. (2560
+    at a ^2.2 interpolation of ~1150 s would have cut 2049-2560-token inputs
+    from 1600 s to 1150 s on no measurement.)"""
+    import math
+    from af3lis.pack import default_sec
+    old_buckets = [256, 512, 768, 1024, 1280, 1536, 2048, 3072, 4096, 5120]
+    old_table = {256: 15, 512: 35, 768: 85, 1024: 160, 1280: 260, 1536: 380,
+                 2048: 700, 3072: 1600, 4096: 3000, 5120: 4800}
+
+    def old_sec(tokens):
+        for b in old_buckets:
+            if tokens <= b:
+                return old_table[b]
+        return old_table.get(int(math.ceil(tokens / 1024.0) * 1024), 700.0)
+
+    for tokens in range(1, 9000, 7):
+        new = default_sec(bucket_of(tokens))
+        assert new >= old_sec(tokens), (tokens, bucket_of(tokens), new,
+                                        old_sec(tokens))
+
+
 def test_measured_3584_condition_fits_its_walltime():
     """One 3,275-token condition needed 1:28:02 of job time on the
     large-model tier and was killed at the 1:10 it was sized for. With the

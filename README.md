@@ -286,16 +286,25 @@ walltime after the GPU time is spent. It covers every bucket on AF3's ladder:
 
 | bucket | s / condition | basis |
 |---|---|---|
-| 512, 768 | 35, 85 | **measured** on A100 (Mau) |
-| 1024, 1280 | 160, 260 | a later probe measured ~87 / ~140 s, startup included |
+| 256 | 15 | original value, unchanged; not measured |
+| 512, 768 | 35, 85 | **measured** ~30 / ~75 s on A100 (Mau); the table adds a margin |
+| 1024, 1280, 1536, 2048, 3072 | 160, 260, 380, 700, 1600 | original `bucket^2.2` extrapolation from 768, unchanged. A later probe measured ~87 / ~140 s at 1024 / 1280 (startup included), and a ~400-pair single-seed campaign finished inside these times at all five |
+| 2560 | 1600 | **not measured**: held at the 3072 time, which is what these inputs were sized and finished with before the ladder had 2560 |
 | 3584 | 5400 | **measured**: one 3,275-token condition took 1:28:02 of job time on the large tier |
-| 4096, 4608, 5120 | 7300, 9400, 11,900 | `bucket^2.2` from the 3584 measurement |
-| the rest | | `bucket^2.2` between measured points; above 5120, extrapolated the same way |
+| 4096, 4608, 5120 | 7300, 9400, 11,900 | `bucket^2.2` up from the 3584 measurement |
+| above 5120 | | `bucket^2.2` up from 5120 (AF3 makes a bucket of exactly the token count there) |
 
 The 3584 point is why the large buckets went **up**: AF3 ran that complex in
 bucket 3584, which this ladder did not have, so it was sized as a 4096 at
 3000 s, killed at 1:10, and finished in 1:28 when resubmitted with 4 h. A table
 that gives a 4096 less time than a measured 3584 needed is not conservative.
+No size class gets less time than it had before the ladder changed.
+
+The step from 3072 (1600 s) to 3584 (5400 s) is 3.4× for a 17 % larger
+bucket. It most likely reflects the large tier's settings (XLA attention
+instead of Triton, spill to host memory) rather than `bucket^2.2` scaling, so
+the exponent is not carried across the tier boundary: down from 3584 it would
+put 3072 near 3,850 s.
 For a new size class or a different GPU, measure first. A probe needs MSAs,
 so align, probe one group, then size the campaign from what it measured:
 

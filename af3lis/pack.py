@@ -20,11 +20,15 @@ rendered ``pack_infer.sbatch`` (which carries our Helix XLA/memory env).
 Timing model per group (Mau's, unchanged):
     walltime = (startup + compile + n_conditions * sec[bucket] * n_seeds) * safety
 
-The default per-bucket table is deliberately conservative. Buckets 512/768
-were measured on A100 (~30/~75 s per condition, 1 seed x 5 samples) and 3584
-on the large-model tier; the rest are ~bucket^2.2 interpolations. Run a probe
-group + ``python -m af3lis.calibrate`` and pass ``--calib calib.json`` before
-sizing a real campaign on a new size class / GPU.
+The default per-bucket table is deliberately conservative. Only two points
+are measured: 512/768 on A100 (~30/~75 s per condition, 1 seed x 5 samples;
+the table adds a margin) and one 3584 condition on the large-model tier.
+1024-2048 and 3072 are the original ~bucket^2.2 extrapolations from 768,
+unchanged because they held in a ~400-pair campaign; 2560 is held at the 3072
+time until measured; 4096-5120 scale up from the 3584 point (see
+DEFAULT_CALIB). Run a probe group + ``python -m af3lis.calibrate`` and pass
+``--calib calib.json`` before sizing a real campaign on a new size class or
+GPU.
 
 CLI:
     python -m af3lis.pack --outdir runs/SCREEN [--target-hours 1.5]
@@ -55,20 +59,34 @@ BUCKETS = [256, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3584, 4096,
 # Seconds per condition (1 seed x 5 diffusion samples). Conservative on
 # purpose: an over-ask costs little queue time on this cluster, an under-ask
 # kills the job at its walltime after the GPU time is spent.
-#   * 512 / 768   MEASURED on A100 (Mau, Aug 2026).
-#   * 1024 / 1280 a later probe measured ~87 / ~140 s per condition, startup
-#                 included; the table stays above that.
+#   * 512 / 768   measured ~30 / ~75 s on A100 (Mau, Aug 2026); the table
+#                 adds a margin.
+#   * 256         the original value, unchanged; not measured.
+#   * 1024-2048, 3072
+#                 the original ~bucket^2.2 extrapolation from 768, unchanged.
+#                 A later probe measured ~87 / ~140 s at 1024 / 1280, startup
+#                 included, and a ~400-pair single-seed campaign finished
+#                 inside these times at all five buckets.
+#   * 2560        NOT measured. AF3 always had this bucket but the old ladder
+#                 did not, so 2049-2560-token inputs were sized as 3072 at
+#                 1600 s and finished inside it. It keeps 1600 until a probe
+#                 says otherwise: a ^2.2 interpolation (~1150) would have been
+#                 the one size class whose ask went DOWN, on no measurement.
 #   * 3584        MEASURED on the large-model tier (XLA attention, 96gb, any
 #                 card): one 3,275-token condition needed 1:28:02 of job time,
 #                 startup included. 5400 s covers it.
-#   * 4096-5120   re-anchored on the 3584 measurement at ~bucket^2.2. They
-#                 were 3000 / 4800, i.e. LESS than a smaller input measured.
-#   * the rest    ~bucket^2.2 interpolations between measured points.
+#   * 4096-5120   ~bucket^2.2 up from the 3584 measurement. They were
+#                 3000 / 4800, i.e. LESS than a smaller input measured.
+#   * 3072 -> 3584 is a 3.4x step for a 17% larger bucket. It most likely
+#                 reflects the tier change (XLA attention instead of Triton,
+#                 host-memory spill) rather than ^2.2 scaling, so ^2.2 is not
+#                 carried across the tier boundary: down from 3584 it would put
+#                 3072 near 3,850 s.
 # Recalibrate (--probe + af3lis.calibrate) for other GPUs / size classes.
 DEFAULT_CALIB = {256: 15, 512: 35, 768: 85, 1024: 160, 1280: 260, 1536: 380,
-                 2048: 700, 2560: 1150, 3072: 1600, 3584: 5400, 4096: 7300,
+                 2048: 700, 2560: 1600, 3072: 1600, 3584: 5400, 4096: 7300,
                  4608: 9400, 5120: 11900}
-SCALING_EXPONENT = 2.2   # seconds ~ bucket^2.2 between and beyond measurements
+SCALING_EXPONENT = 2.2   # beyond the ladder: ~bucket^2.2 up from the top bucket
 # ---------------------------------------------------------------------------
 # Size-aware SLURM resources.
 #
