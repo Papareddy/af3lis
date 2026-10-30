@@ -241,8 +241,9 @@ sequence, so a second label carrying an already-aligned sequence — a
 deliberate homodimer, a duplicated isoform, two accessions for one protein —
 gets no `msa/` directory of its own. The merge resolves every pair chain as
 label → sequence → the monomer emitted for that sequence → its MSA, using
-`monomers/*.json` as the record of what was aligned, and it checks the MSA was
-built for exactly that sequence (a stale `msa/<chain>/` left by an earlier
+`af3_monomer_list.txt` as the record of what was aligned (`--rebuild` leaves
+older inputs in `monomers/`, so that directory is not), and it checks the MSA
+was built for exactly that sequence (a stale `msa/<chain>/` left by an earlier
 build is skipped in favour of AF3's timestamped sibling, or reported). Until
 2026-10 the merge matched by label, so those pairs were reported `MISSING`;
 a run dir built before the fix re-merges correctly with
