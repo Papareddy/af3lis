@@ -856,8 +856,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--pack-copy", action="store_true",
                     help="with --pack: copy data JSONs into groups (default symlink)")
     ap.add_argument("--probe", type=int, default=0, metavar="N",
-                    help="with --pack: build ONE probe group of N modal-bucket "
-                         "conditions (separate out root) for calibration")
+                    help="with --pack: build ONE probe job of N modal-bucket "
+                         "conditions (separate out root) for calibration; "
+                         "--target-hours is raised if needed to keep all N in "
+                         "one job. N >= 5 for a usable calibration")
 
     # collect
     ap.add_argument("--collect", metavar="OUT_DIR",

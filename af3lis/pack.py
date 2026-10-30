@@ -162,6 +162,10 @@ def resources_for(bucket: int) -> dict:
 
 DEFAULT_STARTUP = 90.0    # weights load + first-ever compile (s)
 DEFAULT_COMPILE = 40.0    # per-bucket compile (s); 1 bucket/group -> paid once
+# Smallest probe that can calibrate a bucket: af3lis.calibrate drops the
+# first condition of a log (compile) and cannot time the last, and wants
+# >= 3 measurements (calibrate.MIN_PER_BUCKET + 2).
+MIN_USEFUL_PROBE = 5
 
 
 def bucket_of(tokens: int) -> int:
@@ -493,17 +497,42 @@ def cmd_pack(outdir: str,
         raise SystemExit("no conditions with align output -- run the align stage first")
 
     if probe:
-        # Probe = one group of N conditions from the MODAL bucket, sent to a
+        # Probe = ONE job of N conditions from the MODAL bucket, sent to a
         # SEPARATE output root so its models never mix with the real campaign.
         modal = Counter(r["bucket"] for r in records).most_common(1)[0][0]
         recs = [r for r in records if r["bucket"] == modal][:probe]
         pack_root = os.path.join(outdir, "af3pack_probe")
         out_pack = os.path.join(outdir, "probe_out")
-        groups = build_groups(recs, pack_root, target_hours, safety,
+        # af3lis.calibrate measures inside one log only: the first condition
+        # carries the compile and the last has no end to time, so it needs
+        # MIN_USEFUL_PROBE conditions in the SAME job. Packing the probe to
+        # --target-hours split it -- at bucket >= 3584 into one-condition
+        # jobs that measure nothing -- so the probe's target is raised to fit
+        # every condition in one group, whatever --target-hours says.
+        sec = calib.get(modal, default_sec(modal))
+        ns = Counter(r["nseeds"] for r in recs).most_common(1)[0][0]
+        unit = max(sec * ns, 1.0)            # build_groups' per-condition budget
+        need_h = (startup + compile_s + len(recs) * unit + 1.0) / 3600.0
+        probe_hours = max(target_hours, need_h)
+        groups = build_groups(recs, pack_root, probe_hours, safety,
                               calib, startup, compile_s, copy=copy)
+        if len(groups) != 1:
+            raise SystemExit(f"internal error: probe split into {len(groups)} "
+                             f"jobs; calibrate needs them in one")
         sub = write_submit(groups, pack_root, sbatch_path, out_pack, max_jobs)
         _write_calib_used(pack_root, calib, startup, compile_s, cinfo)
-        print(f"probe: {len(recs)} conditions @ bucket {modal} -> {sub}")
+        print(f"probe: {len(recs)} conditions @ bucket {modal} in ONE job, "
+              f"walltime {groups[0]['walltime']} -> {sub}")
+        if probe_hours > target_hours:
+            print(f"probe: --target-hours {target_hours:g} raised to "
+                  f"{probe_hours:.2f} so every condition shares one log "
+                  f"(calibrate measures within a log only)")
+        if len(recs) < MIN_USEFUL_PROBE:
+            sys.stderr.write(
+                f"[pack] WARNING: {len(recs)} probe condition(s) can give at "
+                f"most {max(len(recs) - 2, 0)} measurement(s); calibrate "
+                f"needs >= {MIN_USEFUL_PROBE} conditions in one job (the "
+                f"first carries the compile, the last has no end to time).\n")
         print(f"after it finishes:  python -m af3lis.calibrate "
               f"{outdir}/logs/pack_af3pack_group_*.out --out {outdir}/calib.json")
         print(f"then re-pack with:  --calib {outdir}/calib.json   "
@@ -550,8 +579,10 @@ def main() -> None:
     ap.add_argument("--copy", action="store_true",
                     help="copy *_data.json into group dirs instead of symlinking")
     ap.add_argument("--probe", type=int, default=0, metavar="N",
-                    help="build ONE probe group of N modal-bucket conditions "
-                         "(separate out root) for calibration, then exit")
+                    help="build ONE probe job of N modal-bucket conditions "
+                         "(separate out root) for calibration, then exit. "
+                         "--target-hours is raised if needed to keep all N in "
+                         "one job; N >= 5 for a usable calibration")
     a = ap.parse_args()
     cmd_pack(a.outdir, target_hours=a.target_hours, safety=a.safety,
              calib_path=a.calib, max_jobs=a.max_jobs, copy=a.copy,

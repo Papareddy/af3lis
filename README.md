@@ -306,13 +306,13 @@ instead of Triton, spill to host memory) rather than `bucket^2.2` scaling, so
 the exponent is not carried across the tier boundary: down from 3584 it would
 put 3072 near 3,850 s.
 For a new size class or a different GPU, measure first. A probe needs MSAs,
-so align, probe one group, then size the campaign from what it measured:
+so align, probe one job, then size the campaign from what it measured:
 
 ```bash
 python pipeline.py --config config.yaml --chains-tsv chains.tsv --name Real --outdir runs/Real
 python pipeline.py --config config.yaml --submit --align-only --outdir runs/Real
 # align finished (monomer mode: python -m af3lis.monomer merge runs/Real first)
-python pipeline.py --pack --probe 10 --outdir runs/Real       # one group, modal bucket
+python pipeline.py --pack --probe 10 --outdir runs/Real       # ONE job, modal bucket
 bash runs/Real/af3pack_probe/submit_all.sh
 # probe finished
 python -m af3lis.calibrate runs/Real/logs/pack_af3pack_group_*.out --out runs/Real/calib.json
@@ -344,7 +344,12 @@ and handed to the bridge's `--pack`.
   first condition of each bucket in each log is skipped because it carries the
   XLA compile, a condition faster than 10 s per seed is skipped as a failed or
   skipped input, and a bucket measured on fewer than 3 conditions is dropped
-  and keeps its built-in time. So a probe needs **≥ 5 conditions** per bucket.
+  and keeps its built-in time. So a probe needs **≥ 5 conditions in one job**
+  (one log): the first is the compile, the last has no end to time. `--probe`
+  therefore always packs its `N` conditions into a single job, raising
+  `--target-hours` for the probe as far as that needs. At the large buckets
+  that is a long job — `--probe 5` at 3584 asks ~10 h of walltime on the
+  built-in 5400 s — so keep `N` near 5 there.
   All of it is recorded under `_meta` in the output.
 * **Refused when implausible.** A calibration more than **2× faster** than the
   built-in table in any bucket is refused: `calibrate` writes it to
@@ -590,7 +595,7 @@ python tests/test_config.py     # config keys -- no pytest
 | `--safety F` | `1.3` | walltime margin on the estimate. |
 | `--calib F` | — (built-in table) | measured per-bucket seconds from `af3lis.calibrate`. **Used only when given**; at build time it is validated, copied to `pack_calib.json` and handed to the bridge. |
 | `--force-calib` | off | use `--calib` even if it is > 2× faster than the built-in table. |
-| `--probe N` | `0` | build ONE isolated calibration group of `N` conditions, output to `probe_out/`. |
+| `--probe N` | `0` | build ONE isolated calibration job of `N` modal-bucket conditions, output to `probe_out/`. `--target-hours` is raised for the probe if needed, so all `N` share one log; `N ≥ 5` for a usable calibration. |
 | `--pack-max-jobs N` | `90` | warn above this many jobs (≈ the 100-job accrual window). |
 | `--pack-copy` | off | copy data JSONs into groups instead of symlinking. Symlinks are the default because MSA-laden JSONs are large. |
 
@@ -880,9 +885,13 @@ before the fix**, so check yours against the middle column.
   as in [Walltime sizing](#walltime-sizing-and-why-you-should-calibrate).
 * **The ≥ 3584-token times rest on one measured condition.** They are
   deliberately generous; calibrate before a campaign dominated by large
-  complexes.
+  complexes. Such a probe is one long job: `--probe 5` at 3584 asks ~10 h of
+  walltime (5 × 5400 s plus startup, × 1.3 safety).
 * **The last condition in each log is never timed** — it has no successor to
-  measure against — so a probe needs at least 5 conditions per bucket.
+  measure against — and the first carries the compile, so a probe needs at
+  least 5 conditions in one job. `--probe` keeps them in one job (until this
+  release it packed the probe to `--target-hours`, which at bucket ≥ 3584
+  meant one condition per job and nothing measured).
 
 ---
 

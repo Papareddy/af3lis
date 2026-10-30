@@ -366,6 +366,66 @@ def test_pack_never_autoloads_a_run_dir_calibration():
     assert json.load(open(used))["status"] == "missing"
 
 
+def _probe_run_dir(n, tokens):
+    """A packable run dir with n pairs of ~`tokens` tokens each."""
+    import json
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, "jsons"))
+    for i in range(n):
+        nm = f"bait___prey{i}"
+        pj = {"name": nm, "modelSeeds": [1],
+              "sequences": [{"protein": {"id": "A", "sequence": "M" * 600}},
+                            {"protein": {"id": "B",
+                                         "sequence": "K" * (tokens - 600 - i)}}]}
+        json.dump(pj, open(os.path.join(d, "jsons", nm + ".json"), "w"))
+        od = os.path.join(d, "out", nm.lower())
+        os.makedirs(od)
+        json.dump(pj, open(os.path.join(od, nm.lower() + "_data.json"), "w"))
+    open(os.path.join(d, "pack_infer.sbatch"), "w").write("#!/bin/bash\n")
+    return d
+
+
+def test_probe_is_one_job_so_calibrate_can_measure_it():
+    """calibrate measures inside one log only (first condition = compile,
+    last = no end), so a probe split across jobs measures little or nothing.
+    Packed to the default 1.5 h target, a 10-condition probe at bucket 3584
+    became ten 1-condition jobs and calibrate stopped with 'no bucket
+    measured'. The probe must be ONE job at every bucket, with a walltime
+    that covers all of it, and its log must then calibrate."""
+    import contextlib, io
+    from af3lis import calibrate as cal
+    from af3lis.pack import MIN_USEFUL_PROBE, cmd_pack, default_sec
+    assert MIN_USEFUL_PROBE == cal.MIN_PER_BUCKET + 2
+    for tokens, bucket in ((1000, 1024), (3200, 3584), (4500, 4608)):
+        d = _probe_run_dir(10, tokens)
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_pack(d, target_hours=1.5, safety=1.3, probe=10)
+        rows = open(os.path.join(d, "af3pack_probe", "groups.tsv")
+                    ).read().strip().splitlines()[1:]
+        assert len(rows) == 1, (bucket, rows)
+        f = rows[0].split("\t")
+        assert int(f[1]) == bucket and int(f[2]) == 10, f
+        h, m, _ = (int(x) for x in f[4].split(":"))
+        need = DEFAULT_STARTUP + DEFAULT_COMPILE + 10 * default_sec(bucket)
+        assert h * 3600 + m * 60 >= need * 1.3, (bucket, f[4], need)
+        # a log of that one job calibrates the bucket (8 of 10 measured)
+        log = _write(_absl_log(10, 1, per_seed=0.8 * default_sec(bucket),
+                               bucket=bucket, tokens0=tokens - 20))
+        out = cal.calibrate(log)
+        assert out["_meta"]["n_per_bucket"][str(bucket)] == 8, out["_meta"]
+
+
+def test_probe_too_small_to_calibrate_is_flagged():
+    import contextlib, io
+    from af3lis.pack import cmd_pack
+    d = _probe_run_dir(4, 1000)
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(err):
+        cmd_pack(d, probe=4)
+    assert "at most 2 measurement" in err.getvalue(), err.getvalue()
+
+
 def test_build_validates_pins_and_hands_calibration_to_the_bridge():
     """--calib at build time used to be accepted and ignored. It is now
     checked while someone is watching, copied into the run dir, and rendered
